@@ -1,0 +1,34 @@
+# Same resolved YOLOv8n as baseline, with CBAM after each Neck C2f output.
+# scripts/train.py maps pretrained layers while skipping the inserted CBAM layers.
+nc: 6
+
+backbone:
+  - [-1, 1, Conv, [16, 3, 2]]
+  - [-1, 1, Conv, [32, 3, 2]]
+  - [-1, 1, C2f, [32, true]]
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 2, C2f, [64, true]]
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [-1, 2, C2f, [128, true]]
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [-1, 1, C2f, [256, true]]
+  - [-1, 1, SPPF, [256, 5]]
+
+head:
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]
+  - [[-1, 6], 1, Concat, [1]]
+  - [-1, 1, C2f, [128]]
+  - [-1, 1, CBAMResearch, [128, 16, 7]]
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 1, C2f, [64]]
+  - [-1, 1, CBAMResearch, [64, 16, 7]]
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]]
+  - [-1, 1, C2f, [128]]
+  - [-1, 1, CBAMResearch, [128, 16, 7]]
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [[-1, 9], 1, Concat, [1]]
+  - [-1, 1, C2f, [256]]
+  - [-1, 1, CBAMResearch, [256, 16, 7]]
+  - [[17, 21, 25], 1, Detect, [nc]]

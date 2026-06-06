@@ -1,38 +1,50 @@
-# YOLOv8-CBAM Ablation Study on DAWN
+# YOLOv8 Progressive Finetuning and CBAM Ablation Study
 
-Pipeline nghiên cứu cho đề tài cải tiến YOLOv8 bằng CBAM trên tập DAWN. Thiết kế
-thực nghiệm chỉ thay đổi kiến trúc attention; seed, dữ liệu, pretrained weights và
-siêu tham số được giữ giống nhau giữa baseline và mô hình cải tiến.
+This repository contains a research pipeline for improving YOLOv8 Nano object
+detection under adverse weather conditions. The main goal is **ablation study**:
+measure how much the CBAM-based architecture improves mAP compared with the
+original YOLOv8 baseline under the same data split, pretrained weights, and
+hyperparameters.
 
-Hướng dẫn chạy end-to-end trên Google Colab: `docs/COLAB.md`.
-
-## 1. Cấu trúc dữ liệu
-
-Giải nén DAWN vào `data/raw/DAWN`. Script hỗ trợ ảnh và Pascal VOC XML nằm ở bất
-kỳ thư mục con nào, miễn ảnh và XML có cùng tên file (ví dụ `rain_001.jpg` và
-`rain_001.xml`).
+Target classes:
 
 ```text
-data/
-├── raw/DAWN/
-│   ├── Fog/
-│   ├── Rain/
-│   ├── Sand/
-│   └── Snow/
-└── processed/dawn_yolo/          # được tạo tự động
-    ├── images/{train,val,test}/
-    ├── labels/{train,val,test}/
-    ├── dataset.yaml
-    └── manifest.csv
+person, bicycle, car, motorcycle, bus, truck
 ```
 
-Sáu lớp mặc định: `person`, `bicycle`, `car`, `motorcycle`, `bus`, `truck`.
-Các alias phổ biến như `pedestrian` và `motorbike` được chuẩn hóa tự động.
+End-to-end Google Colab instructions are available in [docs/COLAB.md](docs/COLAB.md).
 
-## 2. Cài đặt
+## Project Structure
 
-Khuyến nghị Python 3.10 hoặc 3.11 và CUDA GPU. Python 3.13 thường chưa tương
-thích đồng đều với toàn bộ stack học sâu.
+```text
+configs/
+├── experiment.yaml
+└── experiment_colab.yaml
+
+models/
+├── yolov8n_baseline.yaml
+└── yolov8n_cbam_neck.yaml
+
+scripts/
+├── remap_bdd100k_yolo.py
+├── prepare_bdd100k.py
+├── prepare_shift.py
+├── prepare_acdc_dawn.py
+├── prepare_dawn.py
+├── train.py
+├── evaluate.py
+└── compare_results.py
+
+src/dawn_ablation/
+├── attention.py
+├── common.py
+└── data_prep.py
+```
+
+## Environment Setup
+
+Python 3.10 or 3.11 is recommended. Python 3.13 may not be compatible with the
+full deep learning stack.
 
 ```bash
 python3.11 -m venv .venv
@@ -40,12 +52,51 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 3. Chuẩn bị dữ liệu
+On Google Colab, use:
 
-### Stage 1: BDD100K clear daytime
+```bash
+pip install -r requirements-colab.txt
+```
 
-Nếu dùng Kaggle `a7madmostafa/bdd100k-yolo` như cấu trúc
-`bdd100k_yolo_raw/{train,val,test}/images|labels`, chạy script remap YOLO sẵn:
+Do not reinstall PyTorch on Colab unless necessary; Colab already provides a
+CUDA-compatible PyTorch build.
+
+## Multi-Stage Pipeline
+
+### Stage 1: COCO to BDD100K Clear Daytime
+
+Input weights:
+
+```text
+yolov8n.pt
+```
+
+Dataset:
+
+```text
+BDD100K clear daytime subset
+```
+
+Output weights:
+
+```text
+yolov8n_bdd.pt
+```
+
+If you use the Kaggle dataset `a7madmostafa/bdd100k-yolo` with this structure:
+
+```text
+bdd100k_yolo_raw/
+├── train/images
+├── train/labels
+├── val/images
+├── val/labels
+├── test/images
+├── test/labels
+└── data.yaml
+```
+
+remap the original 10-class YOLO labels to the 6 target classes:
 
 ```bash
 python scripts/remap_bdd100k_yolo.py \
@@ -57,10 +108,29 @@ python scripts/remap_bdd100k_yolo.py \
   --clean
 ```
 
-Mặc định script dùng symlink ảnh để tiết kiệm dung lượng. Nếu môi trường không
-hỗ trợ symlink, thêm `--copy-images`.
+By default, the script uses symlinks to save disk space. If your environment does
+not support symlinks, add:
 
-Nếu dùng BDD100K JSON gốc, chạy script convert JSON:
+```bash
+--copy-images
+```
+
+Class remapping:
+
+```text
+person -> person
+rider -> person
+car -> car
+bus -> bus
+truck -> truck
+bike -> bicycle
+motor -> motorcycle
+traffic light -> ignored
+traffic sign -> ignored
+train -> ignored
+```
+
+If you use the original BDD100K detection JSON instead, run:
 
 ```bash
 python scripts/prepare_bdd100k.py \
@@ -73,10 +143,27 @@ python scripts/prepare_bdd100k.py \
   --clean
 ```
 
-Script lọc `weather=clear`, `timeofday=daytime`, map về 6 lớp mục tiêu và tạo
-dataset YOLO train/val cho Stage 1.
+### Stage 2: BDD100K to SHIFT Synthetic Weather
 
-### Stage 2: SHIFT synthetic adverse weather
+Input weights:
+
+```text
+yolov8n_bdd.pt
+```
+
+Dataset:
+
+```text
+SHIFT synthetic fog/rain subset
+```
+
+Output weights:
+
+```text
+yolov8n_shift.pt
+```
+
+Prepare the SHIFT subset:
 
 ```bash
 python scripts/prepare_shift.py \
@@ -90,10 +177,23 @@ python scripts/prepare_shift.py \
   --clean
 ```
 
-Script hỗ trợ annotation dạng BDD/Scalabel JSON hoặc COCO JSON, sau đó chia
-train/val có phân tầng theo weather.
+The script supports BDD/Scalabel-like JSON and COCO-style JSON.
 
-### Stage 3/4: ACDC + DAWN real adverse weather
+### Stage 3 and 4: Real Adverse Weather Ablation
+
+Input weights:
+
+```text
+yolov8n_shift.pt
+```
+
+Dataset:
+
+```text
+ACDC + DAWN, stratified by fog/rain/snow/sand
+```
+
+Prepare the merged real-weather dataset:
 
 ```bash
 python scripts/prepare_acdc_dawn.py \
@@ -107,10 +207,12 @@ python scripts/prepare_acdc_dawn.py \
   --clean
 ```
 
-Script gộp ACDC và DAWN trước, rồi chia stratified 70/15/15 theo weather để dùng
-chung cho baseline và CBAM.
+The merged dataset is split 70/15/15 into train/val/test using stratified
+weather groups.
 
-### DAWN riêng lẻ
+## DAWN-Only Preparation
+
+For a DAWN-only experiment:
 
 ```bash
 python scripts/prepare_dawn.py \
@@ -121,44 +223,89 @@ python scripts/prepare_dawn.py \
   --clean
 ```
 
-Script dùng letterbox về 640x640, cập nhật bbox tương ứng, chia có phân tầng theo
-thư mục thời tiết với tỷ lệ 70/15/15, và tạo `dataset.yaml`.
-`--clean` ngăn file cũ từ lần chia trước gây rò rỉ giữa các split.
+The script converts Pascal VOC XML annotations to YOLO format, applies letterbox
+resizing, and creates `dataset.yaml`.
 
-Kiểm tra `manifest.csv`, số ảnh mỗi split và vài ảnh/nhãn thủ công trước khi
-huấn luyện. Không thay đổi test set sau khi bắt đầu thực nghiệm.
+## Training
 
-## 4. Chạy ablation
-
-Chạy hai thí nghiệm với cùng cấu hình:
+Train the original YOLOv8n baseline:
 
 ```bash
 python scripts/train.py --variant baseline --config configs/experiment.yaml
+```
+
+Train YOLOv8n with CBAM in the Neck:
+
+```bash
 python scripts/train.py --variant cbam --config configs/experiment.yaml
 ```
 
-Đánh giá checkpoint tốt nhất trên test set:
+Resume a Colab run from `last.pt`:
+
+```bash
+python scripts/train.py --variant baseline --config configs/experiment.yaml --resume
+python scripts/train.py --variant cbam --config configs/experiment.yaml --resume
+```
+
+## Evaluation
+
+Evaluate the best checkpoint on the test split:
 
 ```bash
 python scripts/evaluate.py --variant baseline --config configs/experiment.yaml
 python scripts/evaluate.py --variant cbam --config configs/experiment.yaml
+```
+
+Create the final comparison table:
+
+```bash
 python scripts/compare_results.py --config configs/experiment.yaml
 ```
 
-Kết quả cuối nằm tại `runs/ablation/ablation_comparison.csv`. Mỗi thí nghiệm nên
-được chạy tối thiểu 3 seed và báo cáo mean ± standard deviation. Chỉ kết luận
-CBAM hiệu quả nếu mức tăng ổn định qua các seed, không chỉ ở một lần chạy.
-Giao thức báo cáo học thuật chi tiết nằm tại `docs/RESEARCH_PROTOCOL.md`.
+The final CSV is saved to:
 
-## Thiết kế đối chứng
+```text
+runs/ablation/ablation_comparison.csv
+```
 
-- Baseline và CBAM dùng cùng kiến trúc YOLOv8n resolved; CBAM chỉ được thêm sau
-  bốn khối C2f ở Neck.
-- Cùng split, seed, epoch, batch size, augmentation, optimizer và pretrained
-  checkpoint.
-- Chọn `best.pt` bằng validation set; chỉ dùng test set để báo cáo cuối.
-- Báo cáo cả độ chính xác và chi phí: Precision, Recall, mAP50, mAP50-95,
-  inference ms/image, FPS và số tham số.
-- Để so sánh thời gian công bằng, benchmark trên cùng máy, batch=1, cùng imgsz,
-  warmup và số vòng lặp.
-# Object-Detection
+## Ablation Design
+
+The comparison between baseline and CBAM must keep these factors identical:
+
+- dataset split
+- pretrained checkpoint
+- image size
+- batch size
+- optimizer
+- learning rate
+- augmentation settings
+- number of epochs
+- validation and test protocol
+
+The only intended difference is the architecture:
+
+```text
+baseline: YOLOv8n
+cbam:     YOLOv8n + CBAMResearch blocks in the Neck
+```
+
+Report both accuracy and cost:
+
+- Precision
+- Recall
+- mAP@50
+- mAP@50-95
+- inference time
+- FPS
+- number of parameters
+
+For reliable results, run at least three seeds and report mean ± standard
+deviation.
+
+## References
+
+- BDD100K: https://arxiv.org/abs/1805.04687
+- ACDC: https://arxiv.org/abs/2104.13395
+- DAWN: https://arxiv.org/abs/2008.05402
+- CBAM: https://arxiv.org/abs/1807.06521
+- Ultralytics Model YAML Guide: https://docs.ultralytics.com/guides/model-yaml-config/

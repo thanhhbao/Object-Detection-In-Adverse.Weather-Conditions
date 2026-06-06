@@ -1,0 +1,39 @@
+# Dữ liệu ở local Colab để đọc nhanh; kết quả ghi vào Drive để không bị mất.
+data: /content/dawn_yolo/dataset.yaml
+pretrained: yolov8n.pt
+project: /content/drive/MyDrive/YOLOv8_DAWN_Thesis/ablation
+
+seed: 42
+epochs: 100
+imgsz: 640
+batch: 16
+workers: 2
+device: "0"
+optimizer: AdamW
+lr0: 0.001
+lrf: 0.01
+weight_decay: 0.0005
+patience: 30
+cos_lr: true
+deterministic: true
+amp: true
+
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 0.0
+translate: 0.1
+scale: 0.5
+shear: 0.0
+perspective: 0.0
+flipud: 0.0
+fliplr: 0.5
+mosaic: 1.0
+mixup: 0.0
+close_mosaic: 10
+
+conf: 0.001
+iou: 0.6
+benchmark_warmup: 20
+benchmark_iterations: 100
+
