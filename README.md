@@ -1,10 +1,14 @@
-# YOLOv8 Progressive Finetuning and CBAM Ablation Study
+# Research and Enhancement of Deep Learning Models for People and Vehicle Detection in Adverse Weather Conditions for Intelligent Traffic Surveillance
 
-This repository contains a research pipeline for improving YOLOv8 Nano object
-detection under adverse weather conditions. The main goal is **ablation study**:
-measure how much the CBAM-based architecture improves mAP compared with the
-original YOLOv8 baseline under the same data split, pretrained weights, and
-hyperparameters.
+This repository contains a research pipeline for benchmarking and improving deep
+learning object detectors for people and vehicle detection under adverse weather
+conditions. The target application is intelligent traffic surveillance.
+
+The broader study compares multiple detector families, such as YOLOv8, YOLO11,
+YOLOv10, and RT-DETR. The current implementation focuses on a progressive
+finetuning pipeline and a YOLOv8-CBAM ablation branch, where the improved model
+is evaluated against its baseline under the same data split, pretrained weights,
+and hyperparameters.
 
 Target classes:
 
