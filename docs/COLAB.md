@@ -65,7 +65,7 @@ mất; chạy lại Cell 3 với cùng seed sẽ tạo đúng split cũ.
 
 ```python
 %cd /content/drive/MyDrive/Object-Detection
-!python scripts/train.py --variant baseline --config configs/experiment_colab.yaml
+!python scripts/train.py --variant baseline --config configs/ablation/dawn_cbam_colab.yaml
 ```
 
 Kết quả được lưu tại:
@@ -80,7 +80,7 @@ Nếu runtime bị ngắt, chạy lại Cell 1-3 rồi tiếp tục:
 %cd /content/drive/MyDrive/Object-Detection
 !python scripts/train.py \
   --variant baseline \
-  --config configs/experiment_colab.yaml \
+  --config configs/ablation/dawn_cbam_colab.yaml \
   --resume
 ```
 
@@ -88,7 +88,7 @@ Nếu runtime bị ngắt, chạy lại Cell 1-3 rồi tiếp tục:
 
 ```python
 %cd /content/drive/MyDrive/Object-Detection
-!python scripts/train.py --variant cbam --config configs/experiment_colab.yaml
+!python scripts/train.py --variant cbam --config configs/ablation/dawn_cbam_colab.yaml
 ```
 
 Resume khi bị ngắt:
@@ -96,7 +96,7 @@ Resume khi bị ngắt:
 ```python
 !python scripts/train.py \
   --variant cbam \
-  --config configs/experiment_colab.yaml \
+  --config configs/ablation/dawn_cbam_colab.yaml \
   --resume
 ```
 
@@ -108,9 +108,9 @@ Phải chạy lại Cell 3 trước nếu runtime mới chưa có `/content/dawn
 
 ```python
 %cd /content/drive/MyDrive/Object-Detection
-!python scripts/evaluate.py --variant baseline --config configs/experiment_colab.yaml
-!python scripts/evaluate.py --variant cbam --config configs/experiment_colab.yaml
-!python scripts/compare_results.py --config configs/experiment_colab.yaml
+!python scripts/evaluate.py --variant baseline --config configs/ablation/dawn_cbam_colab.yaml
+!python scripts/evaluate.py --variant cbam --config configs/ablation/dawn_cbam_colab.yaml
+!python scripts/compare_results.py --config configs/ablation/dawn_cbam_colab.yaml
 ```
 
 Bảng cuối:

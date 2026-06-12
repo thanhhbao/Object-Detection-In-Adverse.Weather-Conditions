@@ -1,0 +1,26 @@
+# Benchmark baseline: COCO pretrained YOLO11n -> DAWN.
+model: yolo11n.pt
+data: /content/dawn_yolo/dataset.yaml
+project: /content/drive/MyDrive/adverse_weather_project/benchmark
+name: dawn_yolo11n
+
+epochs: 80
+imgsz: 640
+batch: 16
+workers: 4
+device: "0"
+
+optimizer: AdamW
+lr0: 0.001
+lrf: 0.01
+weight_decay: 0.0005
+patience: 25
+cos_lr: true
+deterministic: true
+amp: true
+seed: 42
+
+pretrained: true
+exist_ok: true
+verbose: true
+

@@ -18,7 +18,7 @@ from dawn_ablation.common import load_config, resolve_from_root
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/experiment.yaml")
+    parser.add_argument("--config", default="configs/ablation/dawn_cbam_local.yaml")
     args = parser.parse_args()
     config = load_config(resolve_from_root(args.config))
     project = resolve_from_root(config["project"])

@@ -22,8 +22,19 @@ End-to-end Google Colab instructions are available in [docs/COLAB.md](docs/COLAB
 
 ```text
 configs/
-├── experiment.yaml
-└── experiment_colab.yaml
+├── stages/
+│   ├── stage1_bdd_yolov8n_colab.yaml
+│   ├── stage2_dawn_yolov8n_from_bdd_colab.yaml
+│   └── stage3_acdc_dawn_yolov8n_from_bdd_colab.yaml
+├── ablation/
+│   ├── dawn_cbam_local.yaml
+│   └── dawn_cbam_colab.yaml
+└── benchmark/
+    ├── dawn_yolov8n_colab.yaml
+    ├── dawn_yolov8s_colab.yaml
+    ├── dawn_yolo11n_colab.yaml
+    ├── dawn_yolov10n_colab.yaml
+    └── dawn_rtdetr_l_colab.yaml
 
 models/
 ├── yolov8n_baseline.yaml
@@ -134,6 +145,18 @@ traffic sign -> ignored
 train -> ignored
 ```
 
+Train Stage 1 with a config file:
+
+```bash
+python scripts/train_ultralytics.py --config configs/stages/stage1_bdd_yolov8n_colab.yaml
+```
+
+Resume if Colab disconnects:
+
+```bash
+python scripts/train_ultralytics.py --config configs/stages/stage1_bdd_yolov8n_colab.yaml --resume
+```
+
 If you use the original BDD100K detection JSON instead, run:
 
 ```bash
@@ -235,20 +258,20 @@ resizing, and creates `dataset.yaml`.
 Train the original YOLOv8n baseline:
 
 ```bash
-python scripts/train.py --variant baseline --config configs/experiment.yaml
+python scripts/train.py --variant baseline --config configs/ablation/dawn_cbam_local.yaml
 ```
 
 Train YOLOv8n with CBAM in the Neck:
 
 ```bash
-python scripts/train.py --variant cbam --config configs/experiment.yaml
+python scripts/train.py --variant cbam --config configs/ablation/dawn_cbam_local.yaml
 ```
 
 Resume a Colab run from `last.pt`:
 
 ```bash
-python scripts/train.py --variant baseline --config configs/experiment.yaml --resume
-python scripts/train.py --variant cbam --config configs/experiment.yaml --resume
+python scripts/train.py --variant baseline --config configs/ablation/dawn_cbam_local.yaml --resume
+python scripts/train.py --variant cbam --config configs/ablation/dawn_cbam_local.yaml --resume
 ```
 
 ## Evaluation
@@ -256,14 +279,14 @@ python scripts/train.py --variant cbam --config configs/experiment.yaml --resume
 Evaluate the best checkpoint on the test split:
 
 ```bash
-python scripts/evaluate.py --variant baseline --config configs/experiment.yaml
-python scripts/evaluate.py --variant cbam --config configs/experiment.yaml
+python scripts/evaluate.py --variant baseline --config configs/ablation/dawn_cbam_local.yaml
+python scripts/evaluate.py --variant cbam --config configs/ablation/dawn_cbam_local.yaml
 ```
 
 Create the final comparison table:
 
 ```bash
-python scripts/compare_results.py --config configs/experiment.yaml
+python scripts/compare_results.py --config configs/ablation/dawn_cbam_local.yaml
 ```
 
 The final CSV is saved to:

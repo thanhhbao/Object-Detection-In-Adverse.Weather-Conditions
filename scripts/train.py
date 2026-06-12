@@ -51,7 +51,7 @@ TRAIN_KEYS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", choices=("baseline", "cbam"), required=True)
-    parser.add_argument("--config", default="configs/experiment.yaml")
+    parser.add_argument("--config", default="configs/ablation/dawn_cbam_local.yaml")
     parser.add_argument(
         "--resume", action="store_true", help="Resume this variant from last.pt."
     )

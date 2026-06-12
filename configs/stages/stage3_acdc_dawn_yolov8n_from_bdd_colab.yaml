@@ -1,0 +1,27 @@
+# Stage 3: BDD100K-adapted YOLOv8n -> merged ACDC+DAWN real-weather finetuning.
+# Use this after the ACDC+DAWN dataset has been prepared.
+model: /content/drive/MyDrive/adverse_weather_project/runs/bdd_yolov8n/weights/best.pt
+data: /content/acdc_dawn_yolo/dataset.yaml
+project: /content/drive/MyDrive/adverse_weather_project/runs
+name: acdc_dawn_yolov8n_from_bdd
+
+epochs: 100
+imgsz: 640
+batch: 16
+workers: 4
+device: "0"
+
+optimizer: AdamW
+lr0: 0.0005
+lrf: 0.01
+weight_decay: 0.0005
+patience: 30
+cos_lr: true
+deterministic: true
+amp: true
+seed: 42
+
+pretrained: true
+exist_ok: true
+verbose: true
+

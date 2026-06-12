@@ -1,0 +1,26 @@
+# Stage 1: COCO pretrained YOLOv8n -> BDD100K 6-class driving-domain adaptation.
+model: yolov8n.pt
+data: /content/bdd100k_6cls_yolo/dataset.yaml
+project: /content/drive/MyDrive/adverse_weather_project/runs
+name: bdd_yolov8n
+
+epochs: 50
+imgsz: 640
+batch: 16
+workers: 4
+device: "0"
+
+optimizer: AdamW
+lr0: 0.001
+lrf: 0.01
+weight_decay: 0.0005
+patience: 20
+cos_lr: true
+deterministic: true
+amp: true
+seed: 42
+
+pretrained: true
+exist_ok: true
+verbose: true
+

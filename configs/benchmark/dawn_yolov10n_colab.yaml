@@ -1,0 +1,27 @@
+# Benchmark placeholder: YOLOv10n -> DAWN.
+# Note: confirm Ultralytics support/model name in your Colab version before use.
+model: yolov10n.pt
+data: /content/dawn_yolo/dataset.yaml
+project: /content/drive/MyDrive/adverse_weather_project/benchmark
+name: dawn_yolov10n
+
+epochs: 80
+imgsz: 640
+batch: 16
+workers: 4
+device: "0"
+
+optimizer: AdamW
+lr0: 0.001
+lrf: 0.01
+weight_decay: 0.0005
+patience: 25
+cos_lr: true
+deterministic: true
+amp: true
+seed: 42
+
+pretrained: true
+exist_ok: true
+verbose: true
+
