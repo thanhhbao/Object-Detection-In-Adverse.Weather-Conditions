@@ -1,0 +1,4 @@
+variant: cbam
+base_config: configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml
+model_yaml: models/yolov8n_cbam_neck.yaml
+name: stage2_dawn_yolov8n_cbam

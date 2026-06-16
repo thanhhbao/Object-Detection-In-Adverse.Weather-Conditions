@@ -1,14 +1,7 @@
 # Research and Enhancement of Deep Learning Models for People and Vehicle Detection in Adverse Weather Conditions for Intelligent Traffic Surveillance
 
-This repository contains a research pipeline for benchmarking and improving deep
-learning object detectors for people and vehicle detection under adverse weather
-conditions. The target application is intelligent traffic surveillance.
-
-The broader study compares multiple detector families, such as YOLOv8, YOLO11,
-YOLOv10, and RT-DETR. The current implementation focuses on a progressive
-finetuning pipeline and a YOLOv8-CBAM ablation branch, where the improved model
-is evaluated against its baseline under the same data split, pretrained weights,
-and hyperparameters.
+This repository contains a progressive fine-tuning and ablation-study pipeline
+for detecting people and vehicles under adverse weather conditions.
 
 Target classes:
 
@@ -16,50 +9,90 @@ Target classes:
 person, bicycle, car, motorcycle, bus, truck
 ```
 
-End-to-end Google Colab instructions are available in [docs/COLAB.md](docs/COLAB.md).
+Core research flow:
+
+```text
+COCO pretrained detector
+        ↓
+Stage 1: BDD100K 6-class driving-domain adaptation
+        ↓
+Stage 2: DAWN 6-class adverse-weather fine-tuning
+        ↓
+Evaluation + model comparison + ablation study
+```
 
 ## Project Structure
 
 ```text
-configs/
-├── stages/
-│   ├── stage1_bdd_yolov8n_colab.yaml
-│   ├── stage2_dawn_yolov8n_from_bdd_colab.yaml
-│   └── stage3_acdc_dawn_yolov8n_from_bdd_colab.yaml
-├── ablation/
-│   ├── dawn_cbam_local.yaml
-│   └── dawn_cbam_colab.yaml
-└── benchmark/
-    ├── dawn_yolov8n_colab.yaml
-    ├── dawn_yolov8s_colab.yaml
-    ├── dawn_yolo11n_colab.yaml
-    ├── dawn_yolov10n_colab.yaml
-    └── dawn_rtdetr_l_colab.yaml
-
-models/
-├── yolov8n_baseline.yaml
-└── yolov8n_cbam_neck.yaml
-
-scripts/
-├── remap_bdd100k_yolo.py
-├── prepare_bdd100k.py
-├── prepare_shift.py
-├── prepare_acdc_dawn.py
-├── prepare_dawn.py
-├── train.py
-├── evaluate.py
-└── compare_results.py
-
-src/dawn_ablation/
-├── attention.py
-├── common.py
-└── data_prep.py
+project/
+├── configs/
+│   ├── ultralytics/       # YOLOv8, YOLO11, YOLOv10, RT-DETR experiments
+│   ├── torchvision/       # Faster R-CNN experiments
+│   ├── ablation/          # Architecture/preprocessing ablation experiments
+│   └── common/            # Shared class names, Colab paths, train defaults
+├── scripts/
+│   ├── train_ultralytics.py
+│   ├── train_torchvision.py
+│   ├── train.py           # Custom YOLOv8 ablation trainer, currently CBAM
+│   ├── evaluate.py
+│   ├── eval_all.py
+│   ├── collect_results.py
+│   ├── compare_results.py
+│   └── dataset preparation scripts
+├── datasets/              # Local datasets, ignored by Git except .gitkeep
+├── models/                # Custom YOLO YAML architectures
+└── runs/                  # Training/evaluation outputs, ignored by Git except .gitkeep
 ```
 
-## Environment Setup
+Large datasets, checkpoints, and training outputs are intentionally not tracked
+by Git.
 
-Python 3.10 or 3.11 is recommended. Python 3.13 may not be compatible with the
-full deep learning stack.
+## Config Logic
+
+Experiment configs are intentionally small. Shared values live in:
+
+```text
+configs/common/train_defaults.yaml
+configs/common/paths_colab.yaml
+configs/common/class_names.yaml
+```
+
+Example Stage 1 config:
+
+```yaml
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_colab.yaml
+
+model: yolov8n.pt
+dataset: bdd
+name: stage1_bdd_yolov8n
+```
+
+Example Stage 2 config:
+
+```yaml
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_colab.yaml
+
+from_run: stage1_bdd_yolov8n
+dataset: dawn
+name: stage2_dawn_yolov8n_from_bdd
+
+lr0: 0.0005
+patience: 15
+```
+
+`from_run` is resolved to:
+
+```text
+<project>/<from_run>/weights/best.pt
+```
+
+On Colab, `<project>` comes from `configs/common/paths_colab.yaml`.
+
+## Environment
+
+Local:
 
 ```bash
 python3.11 -m venv .venv
@@ -67,7 +100,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-On Google Colab, use:
+Google Colab:
 
 ```bash
 pip install -r requirements-colab.txt
@@ -76,61 +109,21 @@ pip install -r requirements-colab.txt
 Do not reinstall PyTorch on Colab unless necessary; Colab already provides a
 CUDA-compatible PyTorch build.
 
-## Multi-Stage Pipeline
+## Dataset Preparation
 
-### Stage 1: COCO to BDD100K Clear Daytime
-
-Input weights:
-
-```text
-yolov8n.pt
-```
-
-Dataset:
-
-```text
-BDD100K clear daytime subset
-```
-
-Output weights:
-
-```text
-yolov8n_bdd.pt
-```
-
-If you use the Kaggle dataset `a7madmostafa/bdd100k-yolo` with this structure:
-
-```text
-bdd100k_yolo_raw/
-├── train/images
-├── train/labels
-├── val/images
-├── val/labels
-├── test/images
-├── test/labels
-└── data.yaml
-```
-
-remap the original 10-class YOLO labels to the 6 target classes:
+BDD100K YOLO remapping:
 
 ```bash
 python scripts/remap_bdd100k_yolo.py \
-  --raw-dir data/raw/bdd100k_yolo_raw \
-  --output-dir data/processed/bdd100k_6cls_yolo \
+  --raw-dir datasets/bdd100k_yolo_raw \
+  --output-dir datasets/bdd100k_6cls_yolo \
   --max-train-images 5000 \
   --max-val-images 1000 \
   --seed 42 \
   --clean
 ```
 
-By default, the script uses symlinks to save disk space. If your environment does
-not support symlinks, add:
-
-```bash
---copy-images
-```
-
-Class remapping:
+BDD100K class mapping:
 
 ```text
 person -> person
@@ -140,199 +133,137 @@ bus -> bus
 truck -> truck
 bike -> bicycle
 motor -> motorcycle
-traffic light -> ignored
-traffic sign -> ignored
-train -> ignored
+traffic light/sign/train -> ignored
 ```
 
-Train Stage 1 with a config file:
-
-```bash
-python scripts/train_ultralytics.py --config configs/stages/stage1_bdd_yolov8n_colab.yaml
-```
-
-Resume if Colab disconnects:
-
-```bash
-python scripts/train_ultralytics.py --config configs/stages/stage1_bdd_yolov8n_colab.yaml --resume
-```
-
-If you use the original BDD100K detection JSON instead, run:
-
-```bash
-python scripts/prepare_bdd100k.py \
-  --images-dir data/raw/BDD100K/images/100k/train \
-  --labels-json data/raw/BDD100K/labels/det_train.json \
-  --output-dir data/processed/bdd_clear_yolo \
-  --max-images 5000 \
-  --imgsz 640 \
-  --seed 42 \
-  --clean
-```
-
-### Stage 2: BDD100K to SHIFT Synthetic Weather
-
-Input weights:
-
-```text
-yolov8n_bdd.pt
-```
-
-Dataset:
-
-```text
-SHIFT synthetic fog/rain subset
-```
-
-Output weights:
-
-```text
-yolov8n_shift.pt
-```
-
-Prepare the SHIFT subset:
-
-```bash
-python scripts/prepare_shift.py \
-  --images-dir data/raw/SHIFT/images \
-  --annotations-json data/raw/SHIFT/det_2d.json \
-  --output-dir data/processed/shift_yolo \
-  --weather fog,rain \
-  --max-images 5000 \
-  --imgsz 640 \
-  --seed 42 \
-  --clean
-```
-
-The script supports BDD/Scalabel-like JSON and COCO-style JSON.
-
-### Stage 3 and 4: Real Adverse Weather Ablation
-
-Input weights:
-
-```text
-yolov8n_shift.pt
-```
-
-Dataset:
-
-```text
-ACDC + DAWN, stratified by fog/rain/snow/sand
-```
-
-Prepare the merged real-weather dataset:
-
-```bash
-python scripts/prepare_acdc_dawn.py \
-  --acdc-images-dir data/raw/ACDC/images \
-  --acdc-annotations-json data/raw/ACDC/instances.json \
-  --dawn-raw-dir data/raw/DAWN \
-  --output-dir data/processed/acdc_dawn_yolo \
-  --weather fog,rain,snow,sand \
-  --imgsz 640 \
-  --seed 42 \
-  --clean
-```
-
-The merged dataset is split 70/15/15 into train/val/test using stratified
-weather groups.
-
-## DAWN-Only Preparation
-
-For a DAWN-only experiment:
+DAWN preparation:
 
 ```bash
 python scripts/prepare_dawn.py \
   --raw-dir data/raw/DAWN \
-  --output-dir data/processed/dawn_yolo \
+  --output-dir datasets/dawn_6cls_yolo \
   --imgsz 640 \
   --seed 42 \
   --clean
 ```
 
-The script converts Pascal VOC XML annotations to YOLO format, applies letterbox
-resizing, and creates `dataset.yaml`.
+Expected YOLO dataset YAMLs on Colab:
+
+```text
+/content/bdd100k_6cls_yolo/dataset.yaml
+/content/dawn_6cls_yolo/dataset.yaml
+```
 
 ## Training
 
-Train the original YOLOv8n baseline:
+Stage 1, COCO to BDD100K:
 
 ```bash
-python scripts/train.py --variant baseline --config configs/ablation/dawn_cbam_local.yaml
+python scripts/train_ultralytics.py \
+  --config configs/ultralytics/stage1_bdd_yolov8n.yaml
 ```
 
-Train YOLOv8n with CBAM in the Neck:
+Stage 2, BDD100K to DAWN:
 
 ```bash
-python scripts/train.py --variant cbam --config configs/ablation/dawn_cbam_local.yaml
+python scripts/train_ultralytics.py \
+  --config configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml
 ```
 
-Resume a Colab run from `last.pt`:
+Resume a run:
 
 ```bash
-python scripts/train.py --variant baseline --config configs/ablation/dawn_cbam_local.yaml --resume
-python scripts/train.py --variant cbam --config configs/ablation/dawn_cbam_local.yaml --resume
+python scripts/train_ultralytics.py \
+  --config configs/ultralytics/stage1_bdd_yolov8n.yaml \
+  --resume
 ```
 
-## Evaluation
-
-Evaluate the best checkpoint on the test split:
-
-```bash
-python scripts/evaluate.py --variant baseline --config configs/ablation/dawn_cbam_local.yaml
-python scripts/evaluate.py --variant cbam --config configs/ablation/dawn_cbam_local.yaml
-```
-
-Create the final comparison table:
-
-```bash
-python scripts/compare_results.py --config configs/ablation/dawn_cbam_local.yaml
-```
-
-The final CSV is saved to:
+Use the same pattern for:
 
 ```text
-runs/ablation/ablation_comparison.csv
+YOLOv8n
+YOLOv8s
+YOLO11n
+YOLOv10n
+RT-DETR
 ```
 
-## Ablation Design
+## CBAM Ablation
 
-The comparison between baseline and CBAM must keep these factors identical:
+Train YOLOv8n + CBAM on DAWN using the same Stage 2 base config:
 
-- dataset split
-- pretrained checkpoint
-- image size
-- batch size
-- optimizer
-- learning rate
-- augmentation settings
-- number of epochs
-- validation and test protocol
+```bash
+python scripts/train.py \
+  --config configs/ablation/stage2_dawn_yolov8n_cbam.yaml
+```
 
-The only intended difference is the architecture:
+The CBAM trainer copies compatible pretrained layers from the Stage 1 BDD
+checkpoint and leaves inserted CBAM layers randomly initialized.
+
+If your Stage 1 checkpoint has a different run folder, override it:
+
+```bash
+python scripts/train.py \
+  --config configs/ablation/stage2_dawn_yolov8n_cbam.yaml \
+  --weights /content/drive/MyDrive/adverse_weather_project/runs/bdd_yolov8n/weights/best.pt
+```
+
+Planned but not implemented yet:
 
 ```text
-baseline: YOLOv8n
-cbam:     YOLOv8n + CBAMResearch blocks in the Neck
+stage2_dawn_yolov8n_weather_aug.yaml
+stage2_dawn_yolov8n_dehaze.yaml
 ```
 
-Report both accuracy and cost:
+## Evaluation and Result Collection
 
-- Precision
-- Recall
-- mAP@50
-- mAP@50-95
-- inference time
-- FPS
-- number of parameters
+Evaluate one run:
 
-For reliable results, run at least three seeds and report mean ± standard
-deviation.
+```bash
+python scripts/evaluate.py \
+  --config configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml \
+  --split val
+```
+
+Evaluate all Stage 2 Ultralytics runs:
+
+```bash
+python scripts/eval_all.py --split val
+```
+
+Collect metrics into one CSV:
+
+```bash
+python scripts/collect_results.py --split val
+```
+
+Compare against a baseline:
+
+```bash
+python scripts/compare_results.py \
+  --input /content/drive/MyDrive/adverse_weather_project/runs/val_summary.csv \
+  --baseline stage2_dawn_yolov8n_from_bdd
+```
+
+## Faster R-CNN
+
+Faster R-CNN configs are prepared under:
+
+```text
+configs/torchvision/
+```
+
+The entrypoint exists, but the actual TorchVision training loop is not
+implemented yet:
+
+```bash
+python scripts/train_torchvision.py \
+  --config configs/torchvision/stage1_bdd_faster_rcnn.yaml
+```
 
 ## References
 
 - BDD100K: https://arxiv.org/abs/1805.04687
-- ACDC: https://arxiv.org/abs/2104.13395
 - DAWN: https://arxiv.org/abs/2008.05402
 - CBAM: https://arxiv.org/abs/1807.06521
 - Ultralytics Model YAML Guide: https://docs.ultralytics.com/guides/model-yaml-config/

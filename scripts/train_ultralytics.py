@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Train any Ultralytics detector from a YAML config.
+"""Train an Ultralytics detector from one YAML config.
 
 File này có 3 phần cốt lõi:
-1. Đọc config YAML: model, dataset path, project/name và hyperparameters.
-2. Tạo YOLO model từ checkpoint hoặc model name, ví dụ `yolov8n.pt`.
+1. Đọc config trong `configs/ultralytics/` và ghép với config common.
+2. Tạo YOLO model từ official pretrained hoặc checkpoint stage trước.
 3. Train hoặc resume, rồi lưu toàn bộ output vào thư mục project/name.
 """
 
@@ -18,7 +18,11 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ultralytics import YOLO
 
-from dawn_ablation.common import load_config, resolve_from_root
+from dawn_ablation.common import (
+    experiment_checkpoint,
+    load_experiment_config,
+    resolve_from_root,
+)
 
 TRAIN_KEYS = {
     "epochs", "imgsz", "batch", "workers", "device", "optimizer", "lr0", "lrf",
@@ -30,14 +34,17 @@ TRAIN_KEYS = {
 
 # ---------------------------------------------------------------------------
 # PHẦN 1: ĐỌC CONFIG
-# Config chứa mọi thứ cần chỉnh sau này: model, data, epochs, batch, lr...
-# Nhờ vậy trên Colab chỉ cần sửa YAML thay vì sửa code Python.
+# Mỗi file YAML trong configs/ultralytics/ là một thí nghiệm đầy đủ: model,
+# dataset, project/name và hyperparameters. Script không hard-code đường dẫn.
 # ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
+    parser.add_argument("--weights", default=None)
+    parser.add_argument("--name", default=None)
+    parser.add_argument("--seed", type=int, default=None, help="Override seed for multi-seed runs.")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -47,16 +54,27 @@ def resolve_config_path(value: str | Path) -> str:
     return str(path if path.is_absolute() else resolve_from_root(path))
 
 
+def load_train_config(args: argparse.Namespace) -> dict:
+    config = load_experiment_config(args.config)
+    if args.weights:
+        config["model"] = args.weights
+    if args.name:
+        config["name"] = args.name
+    if args.seed is not None:
+        config["seed"] = args.seed
+    return config
+
+
 # ---------------------------------------------------------------------------
 # PHẦN 2: TẠO MODEL
-# `model` có thể là pretrained official như `yolov8n.pt`, `yolo11n.pt`,
-# hoặc checkpoint tự train như `/content/.../yolov8n_bdd.pt`.
+# Config này chỉ dành cho Ultralytics models như YOLO/RT-DETR. Faster R-CNN dùng
+# `scripts/train_torchvision.py` sau này.
 # ---------------------------------------------------------------------------
 
 
 def build_model(config: dict, resume: bool) -> YOLO:
     if resume:
-        checkpoint = Path(config["project"]) / config["name"] / "weights" / "last.pt"
+        checkpoint = experiment_checkpoint(config, "last.pt")
         if not checkpoint.exists():
             raise FileNotFoundError(f"Cannot resume; missing {checkpoint}")
         return YOLO(str(checkpoint))
@@ -72,7 +90,7 @@ def build_model(config: dict, resume: bool) -> YOLO:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(resolve_from_root(args.config))
+    config = load_train_config(args)
     model = build_model(config, args.resume)
 
     if args.resume:
@@ -93,4 +111,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

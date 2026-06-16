@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 data/raw/
 data/processed/
-runs/
-*.pt
 
+datasets/*
+!datasets/.gitkeep
+
+runs/*
+!runs/.gitkeep
+
+*.pt
+*.pth

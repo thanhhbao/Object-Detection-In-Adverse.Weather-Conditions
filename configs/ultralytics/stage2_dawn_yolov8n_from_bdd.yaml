@@ -1,0 +1,9 @@
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_colab.yaml
+
+from_run: stage1_bdd_yolov8n
+dataset: dawn
+name: stage2_dawn_yolov8n_from_bdd
+
+lr0: 0.0005
+patience: 15

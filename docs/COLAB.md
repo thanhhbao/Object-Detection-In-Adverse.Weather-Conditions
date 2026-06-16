@@ -1,23 +1,18 @@
-# Chạy nghiên cứu trên Google Colab
+# Google Colab Workflow
 
-Chọn `Runtime > Change runtime type > T4 GPU` hoặc GPU tốt hơn trước khi chạy.
-Không train trực tiếp trên ảnh nằm trong Google Drive vì tốc độ đọc file nhỏ
-chậm. Hãy copy/giải nén dữ liệu vào `/content`, nhưng lưu kết quả vào Drive.
-
-## Chuẩn bị trên Google Drive
-
-Đặt repository và file dữ liệu nén theo cấu trúc:
+This guide assumes the repository is cloned to:
 
 ```text
-MyDrive/
-├── Object-Detection/              # repository này
-├── DAWN.zip                       # chứa các ảnh và Pascal VOC XML
-└── YOLOv8_DAWN_Thesis/            # kết quả được tạo tự động
+/content/Object-Detection
 ```
 
-Tên thư mục repository có thể khác. Điều chỉnh lệnh `cd` tương ứng.
+and datasets/checkpoints are stored in:
 
-## Cell 1: Mount Drive và kiểm tra GPU
+```text
+/content/drive/MyDrive/adverse_weather_project
+```
+
+## 1. Mount Drive and Check GPU
 
 ```python
 from google.colab import drive
@@ -26,105 +21,160 @@ drive.mount("/content/drive")
 !nvidia-smi
 ```
 
-## Cell 2: Cài dependency
+If `nvidia-smi` fails, switch Colab runtime to GPU before training.
+
+## 2. Enter Project and Install Dependencies
 
 ```python
-%cd /content/drive/MyDrive/Object-Detection
+%cd /content/Object-Detection
 !pip install -q -r requirements-colab.txt
-
-import torch, ultralytics
-print("torch:", torch.__version__)
-print("CUDA available:", torch.cuda.is_available())
-print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")
-print("ultralytics:", ultralytics.__version__)
 ```
 
-Không cài lại `torch` bằng `requirements.txt`; Colab đã cung cấp bản PyTorch phù
-hợp với CUDA của runtime.
+## 3. Prepare Dataset Folders
 
-## Cell 3: Copy và chuẩn bị DAWN ở local runtime
-
-```python
-%cd /content
-!unzip -q -o "/content/drive/MyDrive/DAWN.zip" -d /content/DAWN_RAW
-
-%cd /content/drive/MyDrive/Object-Detection
-!python scripts/prepare_dawn.py \
-  --raw-dir /content/DAWN_RAW \
-  --output-dir /content/dawn_yolo \
-  --imgsz 640 \
-  --seed 42 \
-  --clean
-```
-
-Sau bước này, kiểm tra số lượng split được in ra và file
-`/content/dawn_yolo/manifest.csv`. Khi runtime bị ngắt, `/content/dawn_yolo` sẽ
-mất; chạy lại Cell 3 với cùng seed sẽ tạo đúng split cũ.
-
-## Cell 4: Huấn luyện baseline
-
-```python
-%cd /content/drive/MyDrive/Object-Detection
-!python scripts/train.py --variant baseline --config configs/ablation/dawn_cbam_colab.yaml
-```
-
-Kết quả được lưu tại:
+The configs expect these dataset YAML files:
 
 ```text
-/content/drive/MyDrive/YOLOv8_DAWN_Thesis/ablation/baseline/
+/content/bdd100k_6cls_yolo/dataset.yaml
+/content/dawn_6cls_yolo/dataset.yaml
 ```
 
-Nếu runtime bị ngắt, chạy lại Cell 1-3 rồi tiếp tục:
+Unzip BDD100K:
 
 ```python
-%cd /content/drive/MyDrive/Object-Detection
-!python scripts/train.py \
-  --variant baseline \
-  --config configs/ablation/dawn_cbam_colab.yaml \
+!rm -rf /content/bdd100k_6cls_yolo
+!unzip -q "/content/drive/MyDrive/adverse_weather_project/datasets/bdd100k_6cls_yolo.zip" -d /content
+!cat /content/bdd100k_6cls_yolo/dataset.yaml
+```
+
+Unzip DAWN:
+
+```python
+!rm -rf /content/dawn_6cls_yolo
+!unzip -q "/content/drive/MyDrive/adverse_weather_project/datasets/dawn_6cls_yolo.zip" -d /content
+!cat /content/dawn_6cls_yolo/dataset.yaml
+```
+
+## 4. Stage 1: Train on BDD100K
+
+YOLOv8n:
+
+```python
+!python scripts/train_ultralytics.py \
+  --config configs/ultralytics/stage1_bdd_yolov8n.yaml
+```
+
+YOLOv8s:
+
+```python
+!python scripts/train_ultralytics.py \
+  --config configs/ultralytics/stage1_bdd_yolov8s.yaml
+```
+
+YOLO11n:
+
+```python
+!python scripts/train_ultralytics.py \
+  --config configs/ultralytics/stage1_bdd_yolo11n.yaml
+```
+
+Resume a disconnected run:
+
+```python
+!python scripts/train_ultralytics.py \
+  --config configs/ultralytics/stage1_bdd_yolov8n.yaml \
   --resume
 ```
 
-## Cell 5: Huấn luyện CBAM
+## 5. Stage 2: Fine-tune on DAWN
 
-```python
-%cd /content/drive/MyDrive/Object-Detection
-!python scripts/train.py --variant cbam --config configs/ablation/dawn_cbam_colab.yaml
+After Stage 1 finishes, Stage 2 automatically loads:
+
+```text
+/content/drive/MyDrive/adverse_weather_project/runs/<stage1_run>/weights/best.pt
 ```
 
-Resume khi bị ngắt:
+YOLOv8n from BDD:
+
+```python
+!python scripts/train_ultralytics.py \
+  --config configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml
+```
+
+If your existing Stage 1 run is named `bdd_yolov8n` instead of
+`stage1_bdd_yolov8n`, override the checkpoint once:
+
+```python
+!python scripts/train_ultralytics.py \
+  --config configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml \
+  --weights /content/drive/MyDrive/adverse_weather_project/runs/bdd_yolov8n/weights/best.pt \
+  --name stage2_dawn_yolov8n_from_bdd
+```
+
+## 6. CBAM Ablation
+
+Run this after the Stage 1 YOLOv8n BDD checkpoint exists:
 
 ```python
 !python scripts/train.py \
-  --variant cbam \
-  --config configs/ablation/dawn_cbam_colab.yaml \
-  --resume
+  --config configs/ablation/stage2_dawn_yolov8n_cbam.yaml
 ```
 
-Không chạy baseline và CBAM đồng thời trên cùng một GPU.
+This is an architecture ablation. Weather augmentation and dehazing configs are
+registered but not implemented yet.
 
-## Cell 6: Đánh giá và tạo bảng ablation
-
-Phải chạy lại Cell 3 trước nếu runtime mới chưa có `/content/dawn_yolo`.
+If your Stage 1 YOLOv8n checkpoint uses the older run name:
 
 ```python
-%cd /content/drive/MyDrive/Object-Detection
-!python scripts/evaluate.py --variant baseline --config configs/ablation/dawn_cbam_colab.yaml
-!python scripts/evaluate.py --variant cbam --config configs/ablation/dawn_cbam_colab.yaml
-!python scripts/compare_results.py --config configs/ablation/dawn_cbam_colab.yaml
+!python scripts/train.py \
+  --config configs/ablation/stage2_dawn_yolov8n_cbam.yaml \
+  --weights /content/drive/MyDrive/adverse_weather_project/runs/bdd_yolov8n/weights/best.pt
 ```
 
-Bảng cuối:
+## 7. Evaluate
 
-```text
-/content/drive/MyDrive/YOLOv8_DAWN_Thesis/ablation/ablation_comparison.csv
+Evaluate one run on validation split:
+
+```python
+!python scripts/evaluate.py \
+  --config configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml \
+  --split val
 ```
 
-## Lưu ý thực nghiệm
+Evaluate CBAM:
 
-- Giữ nguyên loại GPU giữa hai mô hình khi so sánh FPS.
-- `T4`, `L4` và `A100` có tốc độ khác nhau; ghi rõ GPU trong khóa luận.
-- Nếu T4 hết VRAM, giảm `batch` của **cả hai mô hình** xuống cùng giá trị, ví dụ
-  `8`. Không dùng batch khác nhau giữa baseline và CBAM.
-- Chỉ đánh giá test set sau khi đã chốt kiến trúc bằng validation set.
-- Để báo cáo đáng tin cậy, lặp lại với ít nhất ba training seed.
+```python
+!python scripts/evaluate.py \
+  --config configs/ablation/stage2_dawn_yolov8n_cbam.yaml \
+  --split val
+```
 
+Evaluate all Stage 2 Ultralytics runs:
+
+```python
+!python scripts/eval_all.py --split val
+```
+
+Collect results:
+
+```python
+!python scripts/collect_results.py --split val
+```
+
+Compare against YOLOv8n Stage 2:
+
+```python
+!python scripts/compare_results.py \
+  --input /content/drive/MyDrive/adverse_weather_project/runs/val_summary.csv \
+  --baseline stage2_dawn_yolov8n_from_bdd
+```
+
+## 8. Faster R-CNN
+
+Faster R-CNN config files are present, but the TorchVision trainer is still a
+placeholder:
+
+```python
+!python scripts/train_torchvision.py \
+  --config configs/torchvision/stage1_bdd_faster_rcnn.yaml
+```

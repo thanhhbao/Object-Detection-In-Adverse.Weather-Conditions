@@ -19,6 +19,11 @@ def ensure_project_imports() -> None:
         sys.path.insert(0, src)
 
 
+def resolve_from_root(path: str | Path) -> Path:
+    value = Path(path)
+    return value if value.is_absolute() else ROOT / value
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     with Path(path).open(encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
@@ -27,9 +32,57 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return config
 
 
-def resolve_from_root(path: str | Path) -> Path:
-    value = Path(path)
-    return value if value.is_absolute() else ROOT / value
+def merge_experiment_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Merge shared defaults and Colab paths into one runnable experiment config."""
+    merged: dict[str, Any] = {}
+
+    if "defaults" in config:
+        merged.update(load_config(resolve_from_root(config["defaults"])))
+
+    merged.update(config)
+
+    if "paths" in merged:
+        paths_config = load_config(resolve_from_root(merged["paths"]))
+        merged.setdefault("project", paths_config.get("project"))
+
+        dataset_key = merged.get("dataset")
+        if dataset_key and "data" not in merged:
+            try:
+                merged["data"] = paths_config["datasets"][dataset_key]
+            except KeyError as exc:
+                raise KeyError(f"Unknown dataset key in config: {dataset_key}") from exc
+
+    if "from_run" in merged and "model" not in merged:
+        checkpoint_file = merged.get("checkpoint_file", "best.pt")
+        merged["model"] = (
+            Path(merged["project"]) / merged["from_run"] / "weights" / checkpoint_file
+        )
+
+    return merged
+
+
+def load_experiment_config(path: str | Path) -> dict[str, Any]:
+    """Load an experiment YAML and apply shared defaults/paths."""
+    config = load_config(resolve_from_root(path))
+    if "base_config" not in config:
+        return merge_experiment_config(config)
+
+    base = load_experiment_config(config["base_config"])
+    merged = {**base, **config}
+    merged["project"] = base["project"]
+    merged["data"] = base["data"]
+    merged.setdefault("model", base.get("model"))
+    return merged
+
+
+def experiment_run_dir(config: dict[str, Any]) -> Path:
+    """Return the run folder used by both training and evaluation scripts."""
+    return resolve_from_root(config["project"]) / config["name"]
+
+
+def experiment_checkpoint(config: dict[str, Any], filename: str = "best.pt") -> Path:
+    """Return a checkpoint path inside the run folder."""
+    return experiment_run_dir(config) / "weights" / filename
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -45,14 +98,3 @@ def register_custom_modules() -> None:
     from dawn_ablation.attention import CBAMResearch
 
     tasks.CBAMResearch = CBAMResearch
-
-
-def variant_paths(variant: str, config: dict[str, Any]) -> tuple[Path, Path]:
-    if variant not in {"baseline", "cbam"}:
-        raise ValueError(f"Unknown variant: {variant}")
-    model_name = (
-        "yolov8n_baseline.yaml" if variant == "baseline" else "yolov8n_cbam_neck.yaml"
-    )
-    model_yaml = ROOT / "models" / model_name
-    run_dir = resolve_from_root(config["project"]) / variant
-    return model_yaml, run_dir

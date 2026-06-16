@@ -1,0 +1,9 @@
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_colab.yaml
+
+model: rtdetr-l.pt
+dataset: bdd
+name: stage1_bdd_rtdetr
+
+batch: 4
+lr0: 0.0001

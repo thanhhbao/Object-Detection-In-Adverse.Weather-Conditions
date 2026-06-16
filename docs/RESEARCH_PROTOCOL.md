@@ -1,85 +1,167 @@
-# Giao thức nghiên cứu và đối chứng
+# Research Protocol
 
-## Câu hỏi và giả thuyết
+## Research Goal
 
-**RQ:** CBAM tại Neck của YOLOv8n có cải thiện khả năng nhận diện trên ảnh thời
-tiết bất lợi của DAWN hay không, và chi phí tính toán tăng bao nhiêu?
+The thesis focuses on people and vehicle detection under adverse weather
+conditions for intelligent traffic surveillance.
 
-- `H0`: mAP50-95 của YOLOv8n-CBAM không cao hơn baseline một cách ổn định.
-- `H1`: mAP50-95 của YOLOv8n-CBAM cao hơn baseline qua nhiều seed.
-
-CBAM được đặt sau bốn đầu ra C2f trong Neck vì đây là các feature map đã trải qua
-fusion đa tỉ lệ. Channel attention chọn đặc trưng hữu ích; spatial attention tập
-trung vùng ảnh quan trọng khi độ tương phản bị giảm bởi sương mù, mưa hoặc tuyết.
-
-## Ma trận ablation tối thiểu
-
-| ID | Kiến trúc | Pretrained | Split | Hyperparameters |
-|---|---|---|---|---|
-| A0 | YOLOv8n gốc | yolov8n.pt | cố định | cố định |
-| A1 | YOLOv8n + CBAM tại Neck | yolov8n.pt | giống A0 | giống A0 |
-
-Không thay augmentation, epoch, optimizer hoặc ảnh đầu vào giữa A0 và A1. File
-`pretrained_transfer.json` phải cho thấy cùng số tensor/layer YOLO được truyền
-vào hai mô hình. Các tham số CBAM mới được khởi tạo ngẫu nhiên.
-
-Mở rộng sau thí nghiệm tối thiểu:
-
-| ID | Thay đổi duy nhất | Mục đích |
-|---|---|---|
-| A2 | CBAM chỉ tại Backbone | Xác định vị trí attention tốt hơn |
-| A3 | SE tại Neck | Tách tác động channel và spatial attention |
-| A4 | CBAM reduction 8/16/32 | Đánh giá độ nhạy cấu hình |
-
-Chỉ thực hiện A2-A4 sau khi A0-A1 đã chạy ổn định.
-
-## Quy trình
-
-1. Chia DAWN một lần với seed 42. Lưu `manifest.csv` và không thay test set.
-2. Kiểm tra trực quan bbox sau letterbox và thống kê số instance theo lớp/split.
-3. Huấn luyện A0 và A1 với cùng cấu hình. Chọn checkpoint bằng validation set.
-4. Đánh giá `best.pt` đúng một lần trên test set.
-5. Lặp lại huấn luyện với tối thiểu ba training seed, nhưng giữ nguyên data split.
-6. Báo cáo trung bình, độ lệch chuẩn và kết quả theo từng loại thời tiết nếu có.
-
-## Cách báo cáo mức tăng
-
-Hai đại lượng sau khác nhau và cần ghi rõ:
+The practical objective is not to build a production detector immediately. The
+main objective is to run controlled comparisons and ablation studies:
 
 ```text
-Mức tăng tuyệt đối (percentage points) = mAP_cải_tiến - mAP_gốc
-Mức tăng tương đối (%) = (mAP_cải_tiến - mAP_gốc) / mAP_gốc * 100
-FPS = 1000 / inference_time_ms
+How much does each model or improvement change Precision, Recall, mAP50,
+mAP50-95, inference time, FPS, and parameter count?
 ```
 
-Ví dụ mAP50-95 tăng từ `0.400` lên `0.420` nghĩa là tăng `0.020`, hay `2.0`
-điểm phần trăm, tương đương tăng tương đối `5.0%`.
+## Target Classes
 
-## Bảng kết quả đề xuất
+```text
+person, bicycle, car, motorcycle, bus, truck
+```
+
+## Training Flow
+
+The canonical flow is:
+
+```text
+COCO pretrained weights
+        ↓
+Stage 1: BDD100K 6-class driving-domain adaptation
+        ↓
+Stage 2: DAWN 6-class adverse-weather fine-tuning
+        ↓
+Evaluation and comparison
+```
+
+Reason:
+
+```text
+COCO -> DAWN directly forces the model to learn driving domain + adverse weather
+from a small DAWN dataset.
+
+COCO -> BDD100K -> DAWN separates the problem:
+1. learn driving-domain objects first;
+2. then adapt to adverse weather.
+```
+
+## Benchmark Matrix
+
+Main detector comparison:
+
+| ID | Model | Trainer | Stage 1 Config | Stage 2 Config |
+|---|---|---|---|---|
+| B0 | YOLOv8n | Ultralytics | `stage1_bdd_yolov8n.yaml` | `stage2_dawn_yolov8n_from_bdd.yaml` |
+| B1 | YOLOv8s | Ultralytics | `stage1_bdd_yolov8s.yaml` | `stage2_dawn_yolov8s_from_bdd.yaml` |
+| B2 | YOLO11n | Ultralytics | `stage1_bdd_yolo11n.yaml` | `stage2_dawn_yolo11n_from_bdd.yaml` |
+| B3 | YOLOv10n | Ultralytics | `stage1_bdd_yolov10n.yaml` | `stage2_dawn_yolov10n_from_bdd.yaml` |
+| B4 | RT-DETR | Ultralytics | `stage1_bdd_rtdetr.yaml` | `stage2_dawn_rtdetr_from_bdd.yaml` |
+| B5 | Faster R-CNN | TorchVision | `stage1_bdd_faster_rcnn.yaml` | `stage2_dawn_faster_rcnn_from_bdd.yaml` |
+
+Faster R-CNN represents the two-stage detector family against the one-stage YOLO
+models. It is trained with `scripts/train_torchvision.py` and evaluated with
+`scripts/evaluate_torchvision.py`, which writes the same metric JSON format so
+results sit in the same comparison table as the Ultralytics models.
+
+Note on comparability: YOLO `precision`/`recall` come from Ultralytics at its
+own operating point, while Faster R-CNN `precision`/`recall` are computed at a
+fixed (conf 0.25, IoU 0.5) point. `mAP50` and `mAP50-95` are COCO-style for both
+trainers and are the primary comparison metrics.
+
+## Ablation Matrix
+
+Ablations should be run after the main Stage 1 -> Stage 2 benchmark is stable.
+
+| ID | Change | Status | Purpose |
+|---|---|---|---|
+| A0 | YOLOv8n Stage 2 baseline | implemented | Reference detector |
+| A1 | YOLOv8n + CBAM Neck | implemented | Test attention mechanism |
+| A2 | YOLOv8n + weather augmentation | planned | Test training-data robustness |
+| A3 | YOLOv8n + dehazing preprocessing | planned | Test image-restoration preprocessing |
+
+For a fair ablation, only one factor should change at a time. Dataset split,
+pretrained source, image size, optimizer, epochs, early stopping, and evaluation
+protocol should stay fixed unless the experiment explicitly studies them.
+
+## Metrics
+
+Report:
+
+```text
+Precision
+Recall
+mAP50
+mAP50-95
+Ultralytics inference time
+Batch-1 inference time
+FPS
+Parameter count
+```
+
+Distinguish these two quantities:
+
+```text
+Absolute improvement = improved_mAP - baseline_mAP
+Relative improvement (%) = (improved_mAP - baseline_mAP) / baseline_mAP * 100
+```
+
+Example:
+
+```text
+mAP50-95: 0.400 -> 0.420
+absolute improvement = 0.020 = 2.0 percentage points
+relative improvement = 5.0%
+```
+
+## Recommended Reporting Table
 
 | Model | Precision | Recall | mAP50 | mAP50-95 | Params | ms/img | FPS |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| YOLOv8n | mean ± std | mean ± std | mean ± std | mean ± std | ... | ... | ... |
-| YOLOv8n-CBAM | mean ± std | mean ± std | mean ± std | mean ± std | ... | ... | ... |
+| YOLOv8n Stage 2 | ... | ... | ... | ... | ... | ... | ... |
+| YOLOv8s Stage 2 | ... | ... | ... | ... | ... | ... | ... |
+| YOLO11n Stage 2 | ... | ... | ... | ... | ... | ... | ... |
+| YOLOv8n + CBAM | ... | ... | ... | ... | ... | ... | ... |
 
-Nên bổ sung AP theo lớp và theo `fog/rain/sand/snow`. Một mức tăng overall có thể
-che giấu việc mô hình tốt hơn ở một điều kiện nhưng kém hơn đáng kể ở điều kiện
-khác.
+If time allows, report AP per class. DAWN is small, so class imbalance can hide
+weak performance on bicycle, motorcycle, bus, or truck.
 
-## Threats to validity
+## Threats to Validity
 
-- DAWN nhỏ, vì vậy kết quả một seed có phương sai cao.
-- Chia ngẫu nhiên có thể làm ảnh gần giống nhau xuất hiện ở nhiều split; cần kiểm
-  tra nguồn ảnh và loại bỏ duplicate nếu có.
-- Test-set tuning làm kết quả lạc quan giả tạo. Mọi quyết định kiến trúc phải dựa
-  trên validation set.
-- FPS phụ thuộc phần cứng và cách đo. Chỉ so sánh khi cùng máy, precision, batch,
-  kích thước ảnh, warmup và số vòng lặp.
+- DAWN is small, so one seed may produce unstable conclusions.
+- Test-set tuning makes results too optimistic. Use validation results for model
+  decisions and reserve test split for final reporting.
+- BDD100K and DAWN annotation quality may differ, which can affect transfer
+  learning results.
+- FPS depends on hardware, precision mode, batch size, image size, warmup, and
+  measurement method.
 
-## Tài liệu nền
+## Per-Weather and Per-Class Reporting
 
-- DAWN paper: https://arxiv.org/abs/2008.05402
-- CBAM paper: https://arxiv.org/abs/1807.06521
-- Ultralytics model YAML guide:
-  https://docs.ultralytics.com/guides/model-yaml-config/
+- `scripts/evaluate.py` saves a `per_class` block (AP50 and AP50-95 for each of
+  the 6 classes) so weak rare classes stay visible.
+- `scripts/evaluate_by_weather.py` splits the chosen DAWN split by weather
+  (fog/rain/sand/snow/night, read from `manifest.csv`) and reports mAP per
+  condition. This is the core "adverse weather" result and is more informative
+  than a single aggregate mAP.
 
+## Handling Seed Instability
+
+Because DAWN is small, report mean ± std over several seeds for the headline
+comparisons (baseline vs CBAM, and across detectors). Use:
+
+```text
+python scripts/run_seeds.py --config <config> --seeds 0 1 2 --split val
+```
+
+It trains and evaluates each seed in its own run folder and writes a
+`<split>_seeds_summary.json` with mean ± std for Precision/Recall/mAP50/mAP50-95.
+
+## Practical Execution Order
+
+1. Train Stage 1 YOLOv8n on BDD100K.
+2. Train Stage 2 YOLOv8n on DAWN.
+3. Evaluate YOLOv8n Stage 2 and confirm the pipeline works.
+4. Repeat Stage 1 and Stage 2 for other Ultralytics models and Faster R-CNN.
+5. Run CBAM ablation against YOLOv8n Stage 2.
+6. Collect results and compare against the chosen baseline.
+7. Report per-class AP, per-weather mAP, and mean ± std over seeds for the
+   headline comparisons.

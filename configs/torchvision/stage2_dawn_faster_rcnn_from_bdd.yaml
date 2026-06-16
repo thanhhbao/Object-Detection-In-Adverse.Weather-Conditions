@@ -1,0 +1,14 @@
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_colab.yaml
+
+from_run: stage1_bdd_faster_rcnn
+checkpoint_file: best.pth
+dataset: dawn
+name: stage2_dawn_faster_rcnn_from_bdd
+
+epochs: 30
+batch: 4
+optimizer: SGD
+lr0: 0.0025
+momentum: 0.9
+num_classes: 7

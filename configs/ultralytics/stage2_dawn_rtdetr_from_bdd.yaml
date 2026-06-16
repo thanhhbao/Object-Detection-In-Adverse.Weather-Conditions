@@ -1,0 +1,10 @@
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_colab.yaml
+
+from_run: stage1_bdd_rtdetr
+dataset: dawn
+name: stage2_dawn_rtdetr_from_bdd
+
+batch: 4
+lr0: 0.00005
+patience: 15
