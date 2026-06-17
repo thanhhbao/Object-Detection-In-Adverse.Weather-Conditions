@@ -50,9 +50,18 @@ def parse_args() -> argparse.Namespace:
 def group_images_by_weather(manifest: Path, split: str) -> dict[str, list[str]]:
     groups: dict[str, list[str]] = defaultdict(list)
     with manifest.open(encoding="utf-8") as stream:
-        for row in csv.DictReader(stream):
+        reader = csv.DictReader(stream)
+        fields = reader.fieldnames or []
+        # Manifests from different prepare_dawn versions name the image path
+        # column either "image" or "output_image".
+        image_column = next((name for name in ("image", "output_image") if name in fields), None)
+        if image_column is None or "weather" not in fields or "split" not in fields:
+            raise KeyError(
+                f"manifest.csv must have split/weather and an image-path column; got {fields}"
+            )
+        for row in reader:
             if row["split"] == split:
-                groups[row["weather"]].append(row["output_image"])
+                groups[row["weather"]].append(row[image_column])
     return dict(sorted(groups.items()))
 
 
