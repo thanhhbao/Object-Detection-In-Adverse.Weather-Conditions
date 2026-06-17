@@ -100,14 +100,15 @@ def main() -> None:
         listing = work_dir / f"{weather}.txt"
         listing.write_text("\n".join(images) + "\n", encoding="utf-8")
 
+        # Ultralytics requires both 'train' and 'val' keys to exist in any data
+        # YAML, even for validation. Point them all at this weather's listing;
+        # only the requested split is actually iterated.
+        subset = {"path": str(dataset_root), "names": data["names"]}
+        for key in ("train", "val", args.split):
+            subset[key] = str(listing)
+
         subset_yaml = work_dir / f"{weather}.yaml"
-        subset_yaml.write_text(
-            yaml.safe_dump(
-                {"path": str(dataset_root), args.split: str(listing), "names": data["names"]},
-                sort_keys=False,
-            ),
-            encoding="utf-8",
-        )
+        subset_yaml.write_text(yaml.safe_dump(subset, sort_keys=False), encoding="utf-8")
 
         metrics = model.val(
             data=str(subset_yaml),
