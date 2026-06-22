@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weights", default=None)
     parser.add_argument("--name", default=None)
     parser.add_argument("--seed", type=int, default=None, help="Override seed for multi-seed runs.")
+    parser.add_argument("--epochs", type=int, default=None, help="Override epochs (e.g. 1 for a smoke test).")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -95,15 +96,16 @@ def make_loaders(config: dict) -> tuple[DataLoader, DataLoader]:
 # ---------------------------------------------------------------------------
 
 
-def train_one_epoch(model, loader, optimizer, scaler, device, amp) -> float:
+def train_one_epoch(model, loader, optimizer, scaler, device, amp, log_every: int = 50) -> float:
     model.train()
     running = 0.0
-    for images, targets in loader:
+    total = len(loader)
+    for index, (images, targets) in enumerate(loader, start=1):
         images = [image.to(device) for image in images]
         targets = [{key: value.to(device) for key, value in target.items()} for target in targets]
 
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast(enabled=amp):
+        with torch.amp.autocast(device.type, enabled=amp):
             loss_dict = model(images, targets)
             loss = sum(loss_dict.values())
 
@@ -115,7 +117,9 @@ def train_one_epoch(model, loader, optimizer, scaler, device, amp) -> float:
             loss.backward()
             optimizer.step()
         running += float(loss.item())
-    return running / max(len(loader), 1)
+        if index % log_every == 0 or index == total:
+            print(f"    batch {index}/{total} | avg loss {running / index:.4f}", flush=True)
+    return running / max(total, 1)
 
 
 def main() -> None:
@@ -127,6 +131,8 @@ def main() -> None:
         config["name"] = args.name
     if args.seed is not None:
         config["seed"] = args.seed
+    if args.epochs is not None:
+        config["epochs"] = args.epochs
 
     device = resolve_device(config.get("device", "0"))
     torch.manual_seed(int(config.get("seed", 42)))
@@ -157,7 +163,7 @@ def main() -> None:
         scheduler = None
 
     amp = bool(config.get("amp", True)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp)
     patience = int(config.get("patience", 10))
 
     start_epoch = 0
