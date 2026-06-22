@@ -66,13 +66,63 @@ mốc để đánh giá CBAM / weather-augmentation có cải thiện điều ki
 
 ---
 
+## B2 — YOLO11n Stage 2 (BDD100K → DAWN)
+
+- Run: `stage2_dawn_yolo11n_from_bdd`
+- Tham số: 2,583,322 (≈2.6M), 6.3 GFLOPs, 100 layers (fused)
+- Tốc độ (T4): batch-1 14.8 ms → **67.4 FPS**; Ultralytics inference 6.6 ms
+  (151 FPS chế độ batch)
+- Nguồn: `runs/stage2_dawn_yolo11n_from_bdd/val_metrics.json`,
+  `val_metrics_by_weather.json`
+
+### Tổng thể (val, 206 ảnh, 1806 đối tượng)
+
+| Precision | Recall | mAP50 | mAP50-95 |
+|---:|---:|---:|---:|
+| 0.784 | 0.504 | 0.602 | 0.369 |
+
+### Theo từng lớp (val)
+
+| Lớp | P | R | mAP50 | mAP50-95 |
+|---|---:|---:|---:|---:|
+| person | 0.830 | 0.586 | 0.707 | 0.406 |
+| bicycle | 1.000 | 0.328 | 0.415 | 0.215 |
+| car | 0.867 | 0.793 | 0.875 | 0.590 |
+| motorcycle | 0.861 | 0.541 | 0.654 | 0.351 |
+| bus | 0.579 | 0.321 | 0.465 | 0.350 |
+| truck | 0.564 | 0.455 | 0.495 | 0.302 |
+
+### Theo điều kiện thời tiết (val)
+
+| Thời tiết | mAP50 | mAP50-95 |
+|---|---:|---:|
+| fog | 0.687 | 0.434 |
+| rain | 0.637 | 0.435 |
+| snow | 0.687 | 0.433 |
+| sand | 0.573 | 0.365 |
+
+### So sánh với B0 (YOLOv8n)
+
+| | Params | mAP50 | mAP50-95 | Recall |
+|---|---:|---:|---:|---:|
+| YOLOv8n (B0) | 3.0M | **0.639** | **0.426** | **0.579** |
+| YOLO11n (B2) | 2.6M | 0.602 | 0.369 | 0.504 |
+
+**Phát hiện đáng chú ý:** YOLO11n tuy mới hơn và ít tham số hơn nhưng **kém hơn
+YOLOv8n** trên DAWN (mAP50-95 −0.057, recall −0.075). Recall thấp = bỏ sót nhiều
+đối tượng hơn, dù precision cao hơn (0.784 vs 0.662) — model "thận trọng" hơn,
+phát hiện ít nhưng chắc. Đây là material tốt: *kiến trúc mới hơn không đảm bảo
+tốt hơn trên tập dữ liệu nhỏ/đặc thù như thời tiết xấu*.
+
+---
+
 ## Bảng tổng hợp benchmark (điền dần)
 
 | ID | Model | Trainer | Params | mAP50 | mAP50-95 | FPS (b1) | Ghi chú |
 |---|---|---|---:|---:|---:|---:|---|
 | B0 | YOLOv8n | Ultralytics | 3.0M | 0.639 | 0.426 | — | val, seed 42 |
 | B1 | YOLOv8s | Ultralytics | | | | | chưa train |
-| B2 | YOLO11n | Ultralytics | | | | | chưa train |
+| B2 | YOLO11n | Ultralytics | 2.6M | 0.602 | 0.369 | 67.4 | val, seed 42 |
 | B3 | YOLOv10n | Ultralytics | | | | | chưa train |
 | B4 | RT-DETR | Ultralytics | | | | | chưa train |
 | B5 | Faster R-CNN | TorchVision | | | | | chưa train |
