@@ -50,14 +50,14 @@ def resolve_device(device: Any) -> torch.device:
 # ---------------------------------------------------------------------------
 
 
-def _label_dir_for(images_dir: Path) -> Path:
-    """Mirror the Ultralytics convention: .../images/<split> -> .../labels/<split>."""
-    parts = list(images_dir.parts)
+def _label_for_image(image_path: Path) -> Path:
+    """Mirror the Ultralytics convention: .../images/.../x.jpg -> .../labels/.../x.txt."""
+    parts = list(image_path.parts)
     for index in range(len(parts) - 1, -1, -1):
         if parts[index] == "images":
             parts[index] = "labels"
             break
-    return Path(*parts)
+    return Path(*parts).with_suffix(".txt")
 
 
 def _resolve_split_dir(data_yaml: Path, split: str) -> Path:
@@ -79,22 +79,30 @@ def _resolve_split_dir(data_yaml: Path, split: str) -> Path:
 class YoloDetectionDataset(Dataset):
     """Read a YOLO-format split and yield (image_tensor, target) for TorchVision."""
 
-    def __init__(self, data_yaml: Path, split: str):
-        self.images_dir = _resolve_split_dir(data_yaml, split)
-        self.labels_dir = _label_dir_for(self.images_dir)
-        self.images = sorted(
-            path for path in self.images_dir.rglob("*")
-            if path.suffix.lower() in IMAGE_SUFFIXES
-        )
+    def __init__(
+        self,
+        data_yaml: Path | None = None,
+        split: str | None = None,
+        images: list[Path] | None = None,
+    ):
+        # Either scan a YOLO split directory, or use an explicit image list
+        # (used by per-weather evaluation to keep only one weather's images).
+        if images is not None:
+            self.images = sorted(Path(path) for path in images)
+        else:
+            images_dir = _resolve_split_dir(data_yaml, split)
+            self.images = sorted(
+                path for path in images_dir.rglob("*")
+                if path.suffix.lower() in IMAGE_SUFFIXES
+            )
         if not self.images:
-            raise FileNotFoundError(f"No images under {self.images_dir}")
+            raise FileNotFoundError("No images found for this dataset/split.")
 
     def __len__(self) -> int:
         return len(self.images)
 
     def _label_path(self, image_path: Path) -> Path:
-        relative = image_path.relative_to(self.images_dir)
-        return (self.labels_dir / relative).with_suffix(".txt")
+        return _label_for_image(image_path)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         image_path = self.images[index]
