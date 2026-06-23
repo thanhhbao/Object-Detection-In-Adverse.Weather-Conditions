@@ -20,7 +20,7 @@ from pathlib import Path
 
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
@@ -39,6 +39,21 @@ OUT = ROOT / "docs" / "thesis" / "KLTN_full.docx"
 
 TITLE = ("THIẾT KẾ VÀ PHÁT TRIỂN MÔ HÌNH HỌC SÂU PHÁT HIỆN NGƯỜI VÀ PHƯƠNG TIỆN "
          "TRONG ĐIỀU KIỆN THỜI TIẾT BẤT LỢI PHỤC VỤ GIÁM SÁT GIAO THÔNG THÔNG MINH")
+
+REFERENCES = [
+    "Bochkovskiy, A., Wang, C.-Y., & Liao, H.-Y. M. (2020), YOLOv4: Optimal Speed and Accuracy of Object Detection, arXiv:2004.10934.",
+    "Cai, Z., & Vasconcelos, N. (2018), Cascade R-CNN: Delving into High Quality Object Detection, Proceedings of CVPR.",
+    "Dai, J., Li, Y., He, K., & Sun, J. (2016), R-FCN: Object Detection via Region-based Fully Convolutional Networks, Proceedings of NeurIPS.",
+    "Everingham, M., Van Gool, L., Williams, C. K. I., Winn, J., & Zisserman, A. (2010), The PASCAL Visual Object Classes (VOC) Challenge, International Journal of Computer Vision.",
+    "Lin, T.-Y., Goyal, P., Girshick, R., He, K., & Dollar, P. (2017), Focal Loss for Dense Object Detection, Proceedings of ICCV.",
+    "Lin, T.-Y., Maire, M., Belongie, S., et al. (2014), Microsoft COCO: Common Objects in Context, Proceedings of ECCV.",
+    "Liu, S., Qi, L., Qin, H., Shi, J., & Jia, J. (2018), Path Aggregation Network for Instance Segmentation, Proceedings of CVPR.",
+    "Liu, W., Anguelov, D., Erhan, D., et al. (2016), SSD: Single Shot MultiBox Detector, Proceedings of ECCV.",
+    "Redmon, J., Divvala, S., Girshick, R., & Farhadi, A. (2016), You Only Look Once: Unified, Real-Time Object Detection, Proceedings of CVPR.",
+    "Ren, S., He, K., Girshick, R., & Sun, J. (2015), Faster R-CNN: Towards Real-Time Object Detection with Region Proposal Networks, Proceedings of NeurIPS.",
+    "Woo, S., Park, J., Lee, J.-Y., & Kweon, I. S. (2018), CBAM: Convolutional Block Attention Module, Proceedings of ECCV.",
+    "Yu, F., Chen, H., Wang, X., et al. (2020), BDD100K: A Diverse Driving Dataset for Heterogeneous Multitask Learning, Proceedings of CVPR.",
+]
 
 CENTER = WD_ALIGN_PARAGRAPH.CENTER
 JUSTIFY = WD_ALIGN_PARAGRAPH.JUSTIFY
@@ -63,6 +78,15 @@ def new_para_after(ref_paragraph) -> Paragraph:
     element = OxmlElement("w:p")
     ref_paragraph._p.addnext(element)
     return Paragraph(element, ref_paragraph._parent)
+
+
+def delete(paragraph) -> None:
+    paragraph._element.getparent().remove(paragraph._element)
+
+
+def page_break_before(paragraph) -> None:
+    br = paragraph.insert_paragraph_before()
+    br.add_run().add_break(WD_BREAK.PAGE)
 
 
 def fmt(paragraph, *, size=13, bold=False, center=False, justify=False, indent=False):
@@ -173,9 +197,15 @@ def build(document):
             cells[0].text = abbr
             cells[1].text = meaning
 
-    # 5) Chèn Chương 1-5 trước trang PHỤ LỤC (giữ thứ tự nhờ insert_paragraph_before).
+    # Xóa dòng PHỤ LỤC bị sót trong mục lục mẫu; giữ trang PHỤ LỤC thật ở cuối.
     phu_luc = find_last(document, lambda t: t == "PHỤ LỤC")
+    for p in list(document.paragraphs):
+        if p._p is not phu_luc._p and p.text.strip() == "PHỤ LỤC":
+            delete(p)
+
+    # 5) Chèn Chương 1-5 trước trang PHỤ LỤC (giữ thứ tự nhờ insert_paragraph_before).
     for chapter in CHAPTERS:
+        page_break_before(phu_luc)
         h = phu_luc.insert_paragraph_before(chapter["title"], style=HEADING[1][0])
         h.alignment = CENTER
         for kind, text in chapter["body"]:
@@ -185,6 +215,15 @@ def build(document):
                 phu_luc.insert_paragraph_before(text, style=HEADING[3][0])
             else:
                 fmt(phu_luc.insert_paragraph_before(text), size=13, justify=True, indent=True)
+
+    references = find(document, lambda t: t == "DANH MỤC TÀI LIỆU THAM KHẢO")
+    if references is not None:
+        after = references
+        for i, text in enumerate(REFERENCES, start=1):
+            para = new_para_after(after)
+            para.add_run(f"{i}. {text}")
+            fmt(para, size=13, justify=True)
+            after = para
 
     # 6) Section break: phần đầu La Mã -> từ Chương 1 Ả Rập.
     chuong1 = find(document, lambda t: t.startswith("CHƯƠNG 1"))
