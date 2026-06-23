@@ -12,3 +12,7 @@ runs/*
 
 *.pt
 *.pth
+
+# Report/thesis documents (generated locally, not tracked)
+*.docx
+*.doc
