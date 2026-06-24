@@ -116,6 +116,52 @@ tốt hơn trên tập dữ liệu nhỏ/đặc thù như thời tiết xấu*.
 
 ---
 
+## B5 — Faster R-CNN (ResNet50-FPN) Stage 2 (BDD100K → DAWN)
+
+- Run: `stage2_dawn_faster_rcnn_from_bdd` (TorchVision)
+- Tham số: 41,324,786 (≈41,3M), mô hình hai giai đoạn
+- Tốc độ (T4): batch-1 36,7 ms → **27,2 FPS**
+- Dừng sớm ở epoch 17 (patience 10)
+- Nguồn: `runs/stage2_dawn_faster_rcnn_from_bdd/val_metrics.json`,
+  `val_metrics_by_weather.json`, `val_confusion_matrix.png`, `val_pr_curve.png`
+
+### Tổng thể (val, 206 ảnh, 1806 đối tượng)
+
+| Precision | Recall | mAP50 | mAP50-95 |
+|---:|---:|---:|---:|
+| 0.576 | 0.808 | 0.514 | 0.310 |
+
+### Theo từng lớp (mAP50-95, val)
+
+| Lớp | mAP50-95 |
+|---|---:|
+| person | 0.387 |
+| bicycle | 0.190 |
+| car | 0.493 |
+| motorcycle | 0.128 |
+| bus | 0.344 |
+| truck | 0.316 |
+
+### Theo điều kiện thời tiết (val)
+
+| Thời tiết | mAP50 | mAP50-95 |
+|---|---:|---:|
+| fog | 0.749 | 0.442 |
+| snow | 0.723 | 0.461 |
+| rain | 0.624 | 0.431 |
+| sand | 0.366 | 0.225 |
+
+**Phát hiện đáng chú ý:** Faster R-CNN cho mAP50-95 thấp nhất trong ba model đã
+có (0.310 so với 0.426 của YOLOv8n và 0.369 của YOLO11n), dù nặng hơn ~14 lần
+(41,3M tham số) và chậm hơn nhiều (27 FPS). Đặc biệt, recall rất cao (0.808 —
+phát hiện được nhiều đối tượng) nhưng precision thấp (0.576 — nhiều cảnh báo
+sai), ngược hẳn với YOLO11n. Điều kiện bão cát (sand) là điểm yếu rõ rệt nhất
+(mAP50-95 chỉ 0.225). Kết quả củng cố nhận định: *mô hình hai giai đoạn nặng và
+"đói" dữ liệu không phải lựa chọn tốt cho tập thời tiết bất lợi quy mô nhỏ, cả
+về độ chính xác lẫn tốc độ.*
+
+---
+
 ## Bảng tổng hợp benchmark (điền dần)
 
 | ID | Model | Trainer | Params | mAP50 | mAP50-95 | FPS (b1) | Ghi chú |
@@ -125,7 +171,7 @@ tốt hơn trên tập dữ liệu nhỏ/đặc thù như thời tiết xấu*.
 | B2 | YOLO11n | Ultralytics | 2.6M | 0.602 | 0.369 | 67.4 | val, seed 42 |
 | B3 | YOLOv10n | Ultralytics | | | | | chưa train |
 | B4 | RT-DETR | Ultralytics | | | | | chưa train |
-| B5 | Faster R-CNN | TorchVision | | | | | chưa train |
+| B5 | Faster R-CNN | TorchVision | 41.3M | 0.514 | 0.310 | 27.2 | val, seed 42 |
 
 ## Bảng ablation (điền dần)
 
