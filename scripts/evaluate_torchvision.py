@@ -16,8 +16,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import matplotlib
 import torch
+import yaml
 from torch.utils.data import DataLoader
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 
 from dawn_ablation.common import (
     experiment_checkpoint,
@@ -31,9 +37,37 @@ from dawn_ablation.torchvision_detection import (
     benchmark_batch1,
     build_fasterrcnn,
     collate_fn,
-    evaluate_detector,
+    collect_predictions,
+    confusion_matrix_counts,
+    metrics_from_predictions,
+    pr_curve_data,
     resolve_device,
 )
+
+
+def plot_confusion_matrix(cm, class_names, output):
+    labels = class_names + ["background"]
+    normalized = cm / (cm.sum(axis=1, keepdims=True) + 1e-9)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(normalized, cmap="Blues", vmin=0, vmax=1)
+    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels)
+    ax.set_xlabel("Dự đoán"); ax.set_ylabel("Thực tế"); ax.set_title("Confusion Matrix (IoU 0.5, conf 0.25)")
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            ax.text(j, i, f"{cm[i, j]}", ha="center", va="center",
+                    color="white" if normalized[i, j] > 0.5 else "black", fontsize=8)
+    fig.colorbar(im, ax=ax, fraction=0.046)
+    fig.tight_layout(); fig.savefig(output, dpi=150, bbox_inches="tight"); plt.close(fig)
+
+
+def plot_pr_curves(pr_data, class_names, output):
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for cls, (recalls, precisions, ap) in sorted(pr_data.items()):
+        ax.plot(recalls, precisions, label=f"{class_names[cls]} (AP={ap:.3f})")
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precision"); ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.set_title("PR Curve (IoU 0.5)"); ax.legend(loc="lower left", fontsize=8); ax.grid(True, alpha=0.3)
+    fig.tight_layout(); fig.savefig(output, dpi=150, bbox_inches="tight"); plt.close(fig)
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,13 +102,26 @@ def main() -> None:
     model.to(device)
 
     data_yaml = resolve_from_root(config["data"])
+    names = yaml.safe_load(data_yaml.read_text(encoding="utf-8"))["names"]
+    class_names = [names[i] for i in range(len(names))]
     dataset = YoloDetectionDataset(data_yaml, args.split)
     loader = DataLoader(
         dataset, batch_size=int(config["batch"]), shuffle=False,
         num_workers=int(config.get("workers", 4)), collate_fn=collate_fn,
     )
 
-    metrics = evaluate_detector(model, loader, device)
+    # Suy luận một lần, dùng lại cho metric + confusion matrix + PR curve.
+    predictions, targets = collect_predictions(model, loader, device)
+    metrics = metrics_from_predictions(predictions, targets)
+
+    run_dir = experiment_run_dir(config)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cm = confusion_matrix_counts(predictions, targets, len(class_names))
+    pr = pr_curve_data(predictions, targets, len(class_names))
+    plot_confusion_matrix(cm, class_names, run_dir / f"{args.split}_confusion_matrix.png")
+    plot_pr_curves(pr, class_names, run_dir / f"{args.split}_pr_curve.png")
+    print(f"Saved confusion matrix + PR curve to {run_dir}")
+
     sample_image, _ = dataset[0]
     latency_ms, fps = benchmark_batch1(
         model, sample_image, device,

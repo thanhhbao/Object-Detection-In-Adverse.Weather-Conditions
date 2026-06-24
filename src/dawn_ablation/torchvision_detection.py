@@ -220,39 +220,31 @@ def precision_recall_at(
 
 
 @torch.no_grad()
-def evaluate_detector(
-    model: torch.nn.Module,
-    loader,
-    device: torch.device,
-    pr_conf: float = 0.25,
-    pr_iou: float = 0.5,
-) -> dict[str, Any]:
-    """Run the model over `loader` and return the standard metric dictionary."""
-    from torchmetrics.detection import MeanAveragePrecision
-
+def collect_predictions(model: torch.nn.Module, loader, device: torch.device) -> tuple[list, list]:
+    """Chạy model một lần, trả về (predictions, targets) trên CPU để dùng lại cho
+    cả tính metric lẫn vẽ confusion matrix / PR curve (tránh suy luận hai lần)."""
     model.eval()
-    metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox", class_metrics=True)
-    all_predictions: list[dict] = []
-    all_targets: list[dict] = []
-
+    predictions: list[dict] = []
+    targets_out: list[dict] = []
     for images, targets in loader:
         images = [image.to(device) for image in images]
         outputs = model(images)
-        cpu_outputs = [{key: value.cpu() for key, value in output.items()} for output in outputs]
-        cpu_targets = [
-            {"boxes": target["boxes"], "labels": target["labels"]} for target in targets
-        ]
-        metric.update(cpu_outputs, cpu_targets)
-        all_predictions.extend(cpu_outputs)
-        all_targets.extend(cpu_targets)
+        predictions.extend([{k: v.cpu() for k, v in o.items()} for o in outputs])
+        targets_out.extend([{"boxes": t["boxes"], "labels": t["labels"]} for t in targets])
+    return predictions, targets_out
 
+
+def metrics_from_predictions(predictions, targets, pr_conf=0.25, pr_iou=0.5) -> dict[str, Any]:
+    from torchmetrics.detection import MeanAveragePrecision
+
+    metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox", class_metrics=True)
+    metric.update(predictions, targets)
     summary = metric.compute()
-    precision, recall = precision_recall_at(all_predictions, all_targets, pr_conf, pr_iou)
+    precision, recall = precision_recall_at(predictions, targets, pr_conf, pr_iou)
 
     per_class_ap = {}
     if "map_per_class" in summary and summary["map_per_class"].ndim > 0:
-        classes = summary.get("classes")
-        for class_id, ap in zip(classes.tolist(), summary["map_per_class"].tolist()):
+        for class_id, ap in zip(summary["classes"].tolist(), summary["map_per_class"].tolist()):
             per_class_ap[int(class_id)] = float(ap)
 
     return {
@@ -264,6 +256,101 @@ def evaluate_detector(
         "per_class_map50_95": per_class_ap,
         "pr_operating_point": {"conf": pr_conf, "iou": pr_iou},
     }
+
+
+@torch.no_grad()
+def evaluate_detector(model, loader, device, pr_conf=0.25, pr_iou=0.5) -> dict[str, Any]:
+    """Wrapper: thu thập dự đoán rồi tính metric chuẩn."""
+    predictions, targets = collect_predictions(model, loader, device)
+    return metrics_from_predictions(predictions, targets, pr_conf, pr_iou)
+
+
+@torch.no_grad()
+def confusion_matrix_counts(predictions, targets, num_classes, conf=0.25, iou_threshold=0.5):
+    """Ma trận nhầm lẫn cỡ (C+1)x(C+1): hàng = lớp thật, cột = lớp dự đoán, chỉ số
+    cuối = background (FP: nền bị dự đoán là vật; FN: vật bị bỏ sót). Nhãn model
+    là 1..C nên trừ 1 về 0-based."""
+    import numpy as np
+
+    bg = num_classes
+    cm = np.zeros((num_classes + 1, num_classes + 1), dtype=int)
+    for prediction, target in zip(predictions, targets):
+        keep = prediction["scores"] >= conf
+        pred_boxes = prediction["boxes"][keep]
+        pred_idx = (prediction["labels"][keep] - 1).tolist()
+        order = prediction["scores"][keep].argsort(descending=True).tolist()
+
+        gt_boxes = target["boxes"]
+        gt_idx = (target["labels"] - 1).tolist()
+        matched_gt, matched_det = set(), set()
+
+        if len(gt_boxes) and len(pred_boxes):
+            ious = box_iou(pred_boxes, gt_boxes)
+            for det in order:
+                row = ious[det]
+                gt = int(row.argmax())
+                if float(row[gt]) >= iou_threshold and gt not in matched_gt:
+                    cm[gt_idx[gt], pred_idx[det]] += 1
+                    matched_gt.add(gt); matched_det.add(det)
+
+        for det in range(len(pred_boxes)):
+            if det not in matched_det:
+                cm[bg, pred_idx[det]] += 1
+        for gt in range(len(gt_boxes)):
+            if gt not in matched_gt:
+                cm[gt_idx[gt], bg] += 1
+    return cm
+
+
+def _average_precision(recall, precision):
+    import numpy as np
+
+    mrec = np.concatenate(([0.0], recall, [1.0]))
+    mpre = np.concatenate(([1.0], precision, [0.0]))
+    for i in range(len(mpre) - 1, 0, -1):
+        mpre[i - 1] = max(mpre[i - 1], mpre[i])
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
+
+
+@torch.no_grad()
+def pr_curve_data(predictions, targets, num_classes, iou_threshold=0.5):
+    """Với mỗi lớp: trả về (recalls, precisions, AP) tại IoU=0.5 để vẽ PR curve."""
+    import numpy as np
+
+    data = {}
+    for cls in range(num_classes):
+        model_label = cls + 1
+        per_image_gt, total_gt, dets = [], 0, []
+        for index, (prediction, target) in enumerate(zip(predictions, targets)):
+            gt_boxes = target["boxes"][target["labels"] == model_label]
+            per_image_gt.append(gt_boxes)
+            total_gt += len(gt_boxes)
+            mask = prediction["labels"] == model_label
+            for score, box in zip(prediction["scores"][mask].tolist(), prediction["boxes"][mask]):
+                dets.append((score, index, box))
+        if total_gt == 0:
+            continue
+
+        dets.sort(key=lambda item: -item[0])
+        matched = {i: set() for i in range(len(predictions))}
+        tp = np.zeros(len(dets)); fp = np.zeros(len(dets))
+        for k, (_, index, box) in enumerate(dets):
+            gt_boxes = per_image_gt[index]
+            if len(gt_boxes) == 0:
+                fp[k] = 1; continue
+            ious = box_iou(box.unsqueeze(0), gt_boxes)[0]
+            gt = int(ious.argmax())
+            if float(ious[gt]) >= iou_threshold and gt not in matched[index]:
+                tp[k] = 1; matched[index].add(gt)
+            else:
+                fp[k] = 1
+
+        tp_cum, fp_cum = np.cumsum(tp), np.cumsum(fp)
+        recalls = tp_cum / (total_gt + 1e-9)
+        precisions = tp_cum / (tp_cum + fp_cum + 1e-9)
+        data[cls] = (recalls, precisions, _average_precision(recalls, precisions))
+    return data
 
 
 @torch.no_grad()
