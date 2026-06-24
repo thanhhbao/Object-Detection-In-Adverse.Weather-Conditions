@@ -12,6 +12,7 @@ File này song song với `scripts/train_ultralytics.py` nhưng cho nhánh 2-sta
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
@@ -181,7 +182,12 @@ def main() -> None:
         best_map = checkpoint.get("best_map", -1.0)
         print(f"Resumed from epoch {start_epoch}")
 
+    # History bền với gián đoạn: nạp lại khi resume, ghi sau MỖI epoch.
+    history_path = run_dir / "train_history.json"
     history = []
+    if args.resume and history_path.exists():
+        history = json.loads(history_path.read_text(encoding="utf-8")).get("history", [])
+
     for epoch in range(start_epoch, epochs):
         train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, amp)
         if scheduler:
@@ -213,11 +219,13 @@ def main() -> None:
             print(f"  ↳ new best mAP50-95 {best_map:.4f} -> saved {best_path.name}")
         else:
             epochs_without_improve += 1
-            if epochs_without_improve >= patience:
-                print(f"Early stopping at epoch {epoch + 1} (patience {patience}).")
-                break
 
-    write_json(run_dir / "train_history.json", {"history": history, "best_map50_95": best_map})
+        # Ghi history mỗi epoch để không mất nếu GPU bị cắt giữa chừng.
+        write_json(history_path, {"history": history, "best_map50_95": best_map})
+
+        if epochs_without_improve >= patience:
+            print(f"Early stopping at epoch {epoch + 1} (patience {patience}).")
+            break
     print(f"Done. Best mAP50-95 = {best_map:.4f}. Weights in {weights_dir}")
 
 
