@@ -16,3 +16,6 @@ runs/*
 # Report/thesis documents (generated locally, not tracked)
 *.docx
 *.doc
+
+# Report figures (generated locally)
+docs/thesis/figures/
