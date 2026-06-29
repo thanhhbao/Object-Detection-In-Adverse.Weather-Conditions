@@ -1,5 +1,0 @@
-variant: dehaze
-base_config: configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml
-preprocess: dehaze
-name: stage2_dawn_yolov8n_dehaze
-status: planned

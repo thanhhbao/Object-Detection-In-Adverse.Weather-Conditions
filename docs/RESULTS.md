@@ -162,6 +162,55 @@ về độ chính xác lẫn tốc độ.*
 
 ---
 
+## B4 — RT-DETR-l Stage 2 (BDD100K → DAWN)
+
+- Run: `stage2_dawn_rtdetr_from_bdd` (Ultralytics)
+- Tham số: 31,996,070 (≈32,0M), 103.5 GFLOPs, transformer (không cần NMS)
+- Tốc độ (T4): inference 23.1 ms (~43 FPS chế độ batch)
+
+### Tổng thể (val, 206 ảnh, 1806 đối tượng)
+
+| Precision | Recall | mAP50 | mAP50-95 |
+|---:|---:|---:|---:|
+| 0.712 | 0.463 | 0.516 | 0.327 |
+
+### Theo từng lớp (mAP50-95, val)
+
+| Lớp | mAP50-95 |
+|---|---:|
+| person | 0.425 |
+| bicycle | 0.146 |
+| car | 0.566 |
+| motorcycle | 0.328 |
+| bus | 0.140 |
+| truck | 0.355 |
+
+(Per-weather: chờ output `evaluate_by_weather` để bổ sung.)
+
+**Nhận xét:** RT-DETR (32M, transformer) cho mAP50-95 0.327 — **thấp hơn rõ so với
+YOLOv8n (0.426)**, chỉ nhỉnh hơn Faster R-CNN (0.310). Recall thấp (0.463). Mô hình
+transformer "đói dữ liệu" cũng không phát huy trên DAWN nhỏ, củng cố nhận định
+chung của TN1.
+
+---
+
+## KẾT LUẬN TN1 — Benchmark trên dữ liệu nhỏ (DAWN)
+
+| Hạng | Model | Hướng | Params | mAP50 | mAP50-95 | Recall | FPS |
+|---|---|---|---:|---:|---:|---:|---:|
+| 🥇 | **YOLOv8n** | 1-stage | 3.0M | **0.639** | **0.426** | 0.579 | — |
+| 🥈 | YOLO11n | 1-stage | 2.6M | 0.602 | 0.369 | 0.504 | 67.4 |
+| 🥉 | RT-DETR-l | transformer | 32.0M | 0.516 | 0.327 | 0.463 | ~43 |
+| 4 | Faster R-CNN | 2-stage | 41.3M | 0.514 | 0.310 | 0.808 | 27.2 |
+
+**Kết luận TN1:** Trên tập thời tiết bất lợi nhỏ (DAWN), **YOLOv8n (1-stage, nhẹ
+nhất) thắng rõ rệt** cả về độ chính xác lẫn tốc độ. Các mô hình nặng/"đói dữ liệu"
+— RT-DETR (transformer) và Faster R-CNN (2-stage) — **xếp cuối** dù nhiều tham số
+gấp 10–14 lần. Đây là cơ sở đặt ra **TN2**: liệu khi bổ sung dữ liệu thật (XWOD),
+các mô hình nặng có bứt lên và đổi thứ hạng không.
+
+---
+
 ## Bảng tổng hợp benchmark (điền dần)
 
 | ID | Model | Trainer | Params | mAP50 | mAP50-95 | FPS (b1) | Ghi chú |
@@ -170,7 +219,7 @@ về độ chính xác lẫn tốc độ.*
 | B1 | YOLOv8s | Ultralytics | | | | | chưa train |
 | B2 | YOLO11n | Ultralytics | 2.6M | 0.602 | 0.369 | 67.4 | val, seed 42 |
 | B3 | YOLOv10n | Ultralytics | | | | | chưa train |
-| B4 | RT-DETR | Ultralytics | | | | | chưa train |
+| B4 | RT-DETR-l | Ultralytics | 32.0M | 0.516 | 0.327 | ~43 | val, seed 42 |
 | B5 | Faster R-CNN | TorchVision | 41.3M | 0.514 | 0.310 | 27.2 | val, seed 42 |
 
 ## Bảng ablation (điền dần)

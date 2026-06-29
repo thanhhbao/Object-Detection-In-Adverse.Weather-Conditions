@@ -4,4 +4,5 @@ project: /content/drive/MyDrive/adverse_weather_project/runs
 datasets:
   bdd: /content/bdd100k_6cls_yolo/dataset.yaml
   dawn: /content/dawn_6cls_yolo/dataset.yaml
+  xwod: /content/xwod_6cls_yolo/dataset.yaml
 

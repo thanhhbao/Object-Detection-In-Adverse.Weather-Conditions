@@ -1,6 +1,0 @@
-defaults: configs/common/train_defaults.yaml
-paths: configs/common/paths_colab.yaml
-
-model: yolov10n.pt
-dataset: bdd
-name: stage1_bdd_yolov10n

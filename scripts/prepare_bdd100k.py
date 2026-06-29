@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
-"""Prepare BDD100K clear-daytime subset for Stage 1 finetuning.
+"""Prepare BDD100K balanced subset for Stage 1 fine-tuning.
 
-File này có 3 phần cốt lõi:
-1. Đọc annotation JSON của BDD100K và lọc ảnh ban ngày, thời tiết đẹp.
-2. Map class BDD100K về 6 class mục tiêu và chuyển bbox `box2d` sang dạng YOLO.
-3. Chọn tối đa N ảnh, chia train/val và ghi dataset YOLO.
+Lấy tối đa --per-condition ảnh từ mỗi nhóm điều kiện, ghép thành tập
+cân bằng ~30K để Stage 1 không bị bias về clear-daytime.
+
+5 nhóm điều kiện (ánh xạ từ BDD100K weather + timeofday):
+  clear_overcast  — weather ∈ {clear, overcast, partly cloudy}, timeofday = daytime
+  rainy           — weather = rainy, timeofday = any
+  foggy           — weather = foggy,  timeofday = any
+  night           — timeofday = night, weather = any
+  dawn_dusk       — timeofday = dawn/dusk, weather = any
+
+Ví dụ (30K tổng, ~6K mỗi nhóm):
+  python scripts/prepare_bdd100k.py \\
+    --images-dir /content/bdd100k/images/100k/train \\
+    --labels-json /content/bdd100k/labels/det_20/det_train.json \\
+    --output-dir /content/bdd100k_6cls_yolo \\
+    --per-condition 6000 --seed 42
 """
 
 from __future__ import annotations
@@ -25,10 +37,56 @@ from dawn_ablation.data_prep import (
     export_yolo_dataset,
     find_image,
     make_yolo_dirs,
-    normalize_weather,
     read_image_size,
     split_train_val,
 )
+
+# ---------------------------------------------------------------------------
+# Định nghĩa 5 nhóm điều kiện cần cân bằng
+# ---------------------------------------------------------------------------
+
+BDD_WEATHER_NORMALIZE = {
+    "clear": "clear",
+    "overcast": "overcast",
+    "partly cloudy": "partly cloudy",
+    "rainy": "rainy",
+    "foggy": "foggy",
+    "snowy": "snowy",
+    "undefined": "undefined",
+}
+
+BDD_TIME_NORMALIZE = {
+    "daytime": "daytime",
+    "night": "night",
+    "dawn/dusk": "dawn/dusk",
+    "undefined": "undefined",
+}
+
+
+def classify_condition(weather: str, timeofday: str) -> str | None:
+    """Trả về tên nhóm điều kiện hoặc None nếu không thuộc nhóm nào."""
+    w = BDD_WEATHER_NORMALIZE.get(weather.lower(), "undefined")
+    t = BDD_TIME_NORMALIZE.get(timeofday.lower(), "undefined")
+
+    if t == "night":
+        return "night"
+    if t == "dawn/dusk":
+        return "dawn_dusk"
+    if w == "foggy":
+        return "foggy"
+    if w == "rainy":
+        return "rainy"
+    if w in {"clear", "overcast", "partly cloudy"} and t == "daytime":
+        return "clear_overcast"
+    return None
+
+
+CONDITIONS = ["clear_overcast", "rainy", "foggy", "night", "dawn_dusk"]
+
+
+# ---------------------------------------------------------------------------
+# Parse args
+# ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,47 +96,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-images", type=int, default=5000)
+    parser.add_argument("--per-condition", type=int, default=6000,
+                        help="Số ảnh tối đa mỗi nhóm điều kiện (default: 6000 → ~30K tổng)")
     parser.add_argument("--train-ratio", type=float, default=0.80)
-    parser.add_argument("--weather", default="clear")
-    parser.add_argument("--timeofday", default="daytime")
     parser.add_argument("--clean", action="store_true")
     return parser.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# PHẦN 1: ĐỌC VÀ LỌC BDD100K
-# BDD100K detection label là JSON list. Mỗi frame có `name`, `attributes`
-# và danh sách `labels`; bbox nằm trong `label["box2d"]`.
+# Đọc và phân nhóm BDD100K
 # ---------------------------------------------------------------------------
 
 
-def is_selected_frame(frame: dict, weather: str, timeofday: str) -> bool:
-    attributes = frame.get("attributes", {})
-    frame_weather = normalize_weather(attributes.get("weather"))
-    frame_timeofday = str(attributes.get("timeofday", "")).lower()
-    return frame_weather == normalize_weather(weather) and frame_timeofday == timeofday.lower()
-
-
-def load_bdd_samples(images_dir: Path, labels_json: Path, weather: str, timeofday: str) -> list[PreparedSample]:
+def load_bdd_samples(
+    images_dir: Path,
+    labels_json: Path,
+) -> dict[str, list[PreparedSample]]:
+    """Đọc toàn bộ BDD100K train JSON và phân nhóm theo 5 điều kiện."""
     frames = json.loads(labels_json.read_text(encoding="utf-8"))
-    samples: list[PreparedSample] = []
-    skipped_no_image = 0
+    groups: dict[str, list[PreparedSample]] = {c: [] for c in CONDITIONS}
+    skipped = {"no_image": 0, "no_condition": 0, "no_boxes": 0}
 
     for frame in frames:
-        if not is_selected_frame(frame, weather, timeofday):
+        attrs = frame.get("attributes", {})
+        weather = str(attrs.get("weather", "")).strip()
+        timeofday = str(attrs.get("timeofday", "")).strip()
+        condition = classify_condition(weather, timeofday)
+        if condition is None:
+            skipped["no_condition"] += 1
             continue
 
         image_path = find_image(images_dir, frame["name"])
         if image_path is None:
-            skipped_no_image += 1
+            skipped["no_image"] += 1
             continue
+
         image_size = read_image_size(image_path)
         if image_size is None:
             continue
-        width, height = image_size
+        img_w, img_h = image_size
 
-        # BDD box2d dùng tọa độ tuyệt đối: x1, y1, x2, y2.
         boxes = []
         for label in frame.get("labels", []):
             box2d = label.get("box2d")
@@ -86,51 +143,58 @@ def load_bdd_samples(images_dir: Path, labels_json: Path, weather: str, timeofda
                 continue
             box = clamp_box(
                 label.get("category"),
-                box2d["x1"],
-                box2d["y1"],
-                box2d["x2"],
-                box2d["y2"],
-                width,
-                height,
+                box2d["x1"], box2d["y1"],
+                box2d["x2"], box2d["y2"],
+                img_w, img_h,
             )
             if box is not None:
                 boxes.append(box)
 
-        if boxes:
-            samples.append(
-                PreparedSample(
-                    image=image_path,
-                    boxes=tuple(boxes),
-                    split_key="clear",
-                    source="bdd100k",
-                    weather="clear",
-                )
+        if not boxes:
+            skipped["no_boxes"] += 1
+            continue
+
+        groups[condition].append(
+            PreparedSample(
+                image=image_path,
+                boxes=tuple(boxes),
+                split_key=condition,
+                source="bdd100k",
+                weather=condition,
             )
+        )
 
-    if skipped_no_image:
-        print(f"Skipped frames without image file: {skipped_no_image}")
-    return samples
+    print(f"Skipped: {skipped}")
+    return groups
 
 
 # ---------------------------------------------------------------------------
-# PHẦN 2: CHỌN SUBSET VÀ CHIA TRAIN/VAL
-# Stage 1 chỉ cần tập clear-daytime để thích ứng miền dữ liệu. Nếu dữ liệu nhiều,
-# script random chọn tối đa --max-images bằng seed cố định để tái lập.
+# Cân bằng và chọn subset
 # ---------------------------------------------------------------------------
 
 
-def select_subset(samples: list[PreparedSample], max_images: int, seed: int) -> list[PreparedSample]:
-    if max_images <= 0 or len(samples) <= max_images:
-        return samples
+def balanced_subset(
+    groups: dict[str, list[PreparedSample]],
+    per_condition: int,
+    seed: int,
+) -> list[PreparedSample]:
+    """Lấy tối đa per_condition ảnh từ mỗi nhóm, in thống kê."""
     rng = random.Random(seed)
-    selected = rng.sample(samples, max_images)
-    return sorted(selected, key=lambda sample: str(sample.image))
+    selected: list[PreparedSample] = []
+    print(f"\n{'Condition':<18} {'Available':>10} {'Selected':>10}")
+    print("-" * 42)
+    for cond in CONDITIONS:
+        pool = groups[cond]
+        rng.shuffle(pool)
+        take = min(len(pool), per_condition)
+        selected.extend(pool[:take])
+        print(f"{cond:<18} {len(pool):>10} {take:>10}")
+    print(f"{'TOTAL':<18} {sum(len(g) for g in groups.values()):>10} {len(selected):>10}\n")
+    return sorted(selected, key=lambda s: str(s.image))
 
 
 # ---------------------------------------------------------------------------
-# PHẦN 3: XUẤT DATASET YOLO
-# Output gồm images/train, labels/train, images/val, labels/val, manifest.csv
-# và dataset.yaml để dùng trực tiếp với YOLOv8.
+# Main
 # ---------------------------------------------------------------------------
 
 
@@ -142,10 +206,12 @@ def main() -> None:
     clean_output_dir(output_dir, args.clean)
     make_yolo_dirs(output_dir, splits=("train", "val"))
 
-    samples = load_bdd_samples(images_dir, args.labels_json.resolve(), args.weather, args.timeofday)
-    samples = select_subset(samples, args.max_images, args.seed)
+    print("Đang đọc và phân nhóm BDD100K...")
+    groups = load_bdd_samples(images_dir, args.labels_json.resolve())
+    samples = balanced_subset(groups, args.per_condition, args.seed)
+
     if not samples:
-        raise RuntimeError("No BDD100K samples matched the requested filters.")
+        raise RuntimeError("Không tìm thấy ảnh nào sau khi lọc.")
 
     assignments = split_train_val(samples, args.seed, args.train_ratio)
     export_yolo_dataset(

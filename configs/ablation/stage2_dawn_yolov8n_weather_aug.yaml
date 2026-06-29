@@ -1,5 +1,0 @@
-variant: weather_aug
-base_config: configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml
-augmentation: weather_aug
-name: stage2_dawn_yolov8n_weather_aug
-status: planned
