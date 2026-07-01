@@ -1,0 +1,4 @@
+variant: cbam
+base_config: configs/ultralytics/phase2_final_yolov8n_from_xwod.yaml
+model_yaml: models/yolov8n_cbam_neck.yaml
+name: phase2_yolov8n_cbam

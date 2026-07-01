@@ -1,9 +1,9 @@
 defaults: configs/common/train_defaults.yaml
 paths: configs/common/paths_colab.yaml
 
-from_run: stage2_dawn_yolov8n_from_bdd
+from_run: stage2_xwod_yolo11n_from_bdd30k
 dataset: xwod
-name: stage3_xwod_yolov8n_from_dawn
+name: phase2_final_yolo11n
 
-lr0: 0.0001
-patience: 15
+lr0: 0.00005
+patience: 20

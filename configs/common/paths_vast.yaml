@@ -1,0 +1,9 @@
+drive_root: /workspace/datasets
+project: /workspace/runs
+
+datasets:
+  bdd_6cls_30k: /workspace/datasets/bdd100k_6cls_30k_yolo/dataset.yaml
+  bdd_6cls_full: /workspace/datasets/bdd100k_6cls_full_yolo/dataset.yaml
+  dawn: /workspace/datasets/dawn_6cls_yolo/dataset.yaml
+  xwod: /workspace/datasets/xwod_6cls_yolo/dataset.yaml
+  acdc: /workspace/datasets/acdc_6cls_yolo/dataset.yaml

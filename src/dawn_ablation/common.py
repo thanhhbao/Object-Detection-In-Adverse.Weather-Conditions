@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -33,13 +34,22 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
 
 def merge_experiment_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Merge shared defaults and Colab paths into one runnable experiment config."""
+    """Merge shared defaults and paths into one runnable experiment config.
+
+    The paths file is resolved in this order (first match wins):
+      1. OD_PATHS environment variable  (e.g. export OD_PATHS=configs/common/paths_vast.yaml)
+      2. 'paths' key inside the experiment YAML
+    """
     merged: dict[str, Any] = {}
 
     if "defaults" in config:
         merged.update(load_config(resolve_from_root(config["defaults"])))
 
     merged.update(config)
+
+    env_paths = os.environ.get("OD_PATHS")
+    if env_paths:
+        merged["paths"] = env_paths
 
     if "paths" in merged:
         paths_config = load_config(resolve_from_root(merged["paths"]))

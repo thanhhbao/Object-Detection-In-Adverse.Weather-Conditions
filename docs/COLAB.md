@@ -1,22 +1,23 @@
 # Google Colab Workflow
 
-Pipeline 3 giai đoạn huấn luyện + ablation study.
+Pipeline 2-phase: fair model selection → final model training.
 
 ```
-COCO pretrained
-    ↓ Stage 1 (cả 4 model)
-BDD_balanced_30K  (traffic domain)
-    ↓ Stage 2 (cả 4 model)
-DAWN_train        (adverse weather)
-    → đánh giá DAWN_test + XWOD_held-out → chọn winner
-    ↓ Stage 3 (winner only)
-XWOD_filtered     (+ optional DAWN mixed)
-    → ablation study
+PHASE 1 — Fair Model Selection (cả 4 model)
+  COCO pretrained → BDD100K → XWOD_train
+  → Evaluate: XWOD_test + DAWN_test + ACDC_test + BDD_val + video
+  → Rank → chọn winner
+
+PHASE 2 — Final Model Training (winner only)
+  Winner → XWOD_train + ACDC_train + optional DAWN_train + BDD replay 20–30%
+  → Final eval: XWOD_test + DAWN_test + ACDC_test + video
 ```
 
-Datasets và checkpoints lưu tại Drive:
+6 class: person(0), bicycle(1), car(2), motorcycle(3), bus(4), truck(5)
+
+Drive root:
 ```
-/content/drive/MyDrive/adverse_weather_project/
+DRIVE=/content/drive/MyDrive/adverse_weather_project
 ```
 
 ---
@@ -28,142 +29,163 @@ from google.colab import drive
 drive.mount("/content/drive")
 !nvidia-smi
 
+%cd /content
+!git clone https://github.com/thanhhbao/Object-Detection-In-Adverse.Weather-Conditions.git Object-Detection
 %cd /content/Object-Detection
 !pip install -q -r requirements-colab.txt
+
+DRIVE="/content/drive/MyDrive/adverse_weather_project"
 ```
 
 ---
 
-## Bước 1 — Chuẩn hóa dữ liệu (6 class)
+## 1. Chuẩn hóa dataset (chỉ làm 1 lần, zip lưu Drive)
 
-### BDD100K — 30K ảnh clear-daytime
+### BDD100K — 30K ảnh cân bằng 5 điều kiện
 
 ```python
-# Nếu chưa có bdd100k_6cls_yolo_30k.zip trên Drive:
+# Cần: BDD100K raw (images + det_train.json)
+# Tải từ Kaggle:
+#   !kaggle datasets download -d <bdd100k-detection-dataset> -p /content/bdd100k_raw --unzip
+# hoặc nuImages (nuscenes.org) → dùng prepare_bdd100k.py tương tự
+
 !python scripts/prepare_bdd100k.py \
   --images-dir /content/bdd100k_raw/bdd100k/images/100k/train \
   --labels-json /content/bdd100k_raw/bdd100k/labels/det_20/det_train.json \
   --output-dir /content/bdd100k_6cls_yolo \
   --per-condition 6000 --seed 42
-# → ~30K ảnh cân bằng: clear/overcast, rainy, foggy, night, dawn/dusk (~6K mỗi nhóm)
+# → ~30K ảnh: clear/overcast, rainy, foggy, night, dawn/dusk (~6K mỗi nhóm)
+
 !zip -q -r "$DRIVE/datasets/bdd100k_6cls_yolo_30k.zip" /content/bdd100k_6cls_yolo
 
-# Các session sau (zip đã có):
-DRIVE="/content/drive/MyDrive/adverse_weather_project"
+# Các session sau:
 !unzip -q "$DRIVE/datasets/bdd100k_6cls_yolo_30k.zip" -d /content
 ```
 
-### DAWN — split 70/15/15 train/val/test (theo weather)
+### XWOD — tất cả điều kiện
 
 ```python
+!unzip -q "$DRIVE/datasets/XWOD.zip" -d /content
+
+!python scripts/prepare_xwod.py \
+  --src /content/XWOD/dataset \
+  --dst /content/xwod_6cls_yolo \
+  --weather all
+!cat /content/xwod_6cls_yolo/dataset.yaml
+
+!zip -q -r "$DRIVE/datasets/xwod_6cls_yolo.zip" /content/xwod_6cls_yolo
+# Các session sau: !unzip -q "$DRIVE/datasets/xwod_6cls_yolo.zip" -d /content
+```
+
+### ACDC — fog, rain, snow, night (panoptic → YOLO bbox)
+
+```python
+# Tải từ acdc.vision.ee.ethz.ch (đăng ký miễn phí)
+# Upload zip lên Drive rồi:
+!unzip -q "$DRIVE/datasets/ACDC.zip" -d /content/acdc_raw
+
+!python scripts/prepare_acdc.py \
+  --raw-dir /content/acdc_raw \
+  --output-dir /content/acdc_6cls_yolo \
+  --conditions all --seed 42
+!cat /content/acdc_6cls_yolo/dataset.yaml
+
+!zip -q -r "$DRIVE/datasets/acdc_6cls_yolo.zip" /content/acdc_6cls_yolo
+# Các session sau: !unzip -q "$DRIVE/datasets/acdc_6cls_yolo.zip" -d /content
+```
+
+### DAWN — chỉ cần test split (held-out, không train)
+
+```python
+# DAWN chỉ dùng để evaluate — cần split 70/15/15 để có test set
+!unzip -q "$DRIVE/datasets/DAWN_raw.zip" -d /content/DAWN_raw
+
 !python scripts/prepare_dawn.py \
   --raw-dir /content/DAWN_raw \
   --output-dir /content/dawn_6cls_yolo \
   --imgsz 640 --seed 42
-# Lưu lên Drive một lần:
+# → train(70%) / val(15%) / test(15%) theo weather stratified
+
 !zip -q -r "$DRIVE/datasets/dawn_6cls_yolo.zip" /content/dawn_6cls_yolo
-
-# Các session sau:
-!unzip -q "$DRIVE/datasets/dawn_6cls_yolo.zip" -d /content
-!cat /content/dawn_6cls_yolo/dataset.yaml
-```
-
-### XWOD — giữ tất cả điều kiện (train/val/test có sẵn)
-
-```python
-!unzip -q "$DRIVE/datasets/XWOD.zip" -d /content
-!python scripts/prepare_xwod.py \
-  --src /content/XWOD/dataset \
-  --dst /content/xwod_6cls_yolo \
-  --weather all   # fog, rain, snow, sand, flooding, tornado, wildfire
-!cat /content/xwod_6cls_yolo/dataset.yaml
-```
-
-XWOD_filtered (chỉ fog/rain/snow/sand — dùng cho Stage 3 fine-tune):
-```python
-!python scripts/prepare_xwod.py \
-  --src /content/XWOD/dataset \
-  --dst /content/xwod_filtered_6cls_yolo \
-  --weather fog,rain,snow,sand
+# Các session sau: !unzip -q "$DRIVE/datasets/dawn_6cls_yolo.zip" -d /content
 ```
 
 ---
 
-## Bước 2 — Train tất cả 4 model (Stage 1 BDD → Stage 2 DAWN)
-
-Mỗi model chạy 2 bước tuần tự. Dùng `--resume` khi session bị ngắt.
-
-### YOLOv8n
+## 2. Phase 1 — Train Stage 1: BDD (cả 4 model)
 
 ```python
-# Stage 1: COCO → BDD
 !python scripts/train_ultralytics.py --config configs/ultralytics/stage1_bdd_yolov8n.yaml
-# Stage 2: BDD → DAWN_train
-!python scripts/train_ultralytics.py --config configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml
-```
-
-### YOLO11n
-
-```python
 !python scripts/train_ultralytics.py --config configs/ultralytics/stage1_bdd_yolo11n.yaml
-!python scripts/train_ultralytics.py --config configs/ultralytics/stage2_dawn_yolo11n_from_bdd.yaml
-```
-
-### RT-DETR-l
-
-```python
 !python scripts/train_ultralytics.py --config configs/ultralytics/stage1_bdd_rtdetr.yaml
-!python scripts/train_ultralytics.py --config configs/ultralytics/stage2_dawn_rtdetr_from_bdd.yaml
-```
-
-### Faster R-CNN (ResNet50-FPN)
-
-```python
 !python scripts/train_torchvision.py --config configs/torchvision/stage1_bdd_faster_rcnn.yaml
-!python scripts/train_torchvision.py --config configs/torchvision/stage2_dawn_faster_rcnn_from_bdd.yaml
 ```
 
-Resume nếu ngắt giữa chừng:
+Resume nếu ngắt:
 ```python
-!python scripts/train_ultralytics.py --config configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml --resume
+!python scripts/train_ultralytics.py --config configs/ultralytics/stage1_bdd_yolov8n.yaml --resume
 ```
 
 ---
 
-## Bước 3 — Đánh giá để chọn model
+## 3. Phase 1 — Train Stage 2: XWOD (cả 4 model)
 
-### Trên DAWN_test (held-out)
+```python
+!python scripts/train_ultralytics.py --config configs/ultralytics/stage2_xwod_yolov8n_from_bdd.yaml
+!python scripts/train_ultralytics.py --config configs/ultralytics/stage2_xwod_yolo11n_from_bdd.yaml
+!python scripts/train_ultralytics.py --config configs/ultralytics/stage2_xwod_rtdetr_from_bdd.yaml
+!python scripts/train_torchvision.py --config configs/torchvision/stage2_xwod_faster_rcnn_from_bdd.yaml
+```
+
+---
+
+## 4. Phase 1 — Evaluate để chọn model
+
+### XWOD_test
 
 ```python
 for cfg in [
-    "configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml",
-    "configs/ultralytics/stage2_dawn_yolo11n_from_bdd.yaml",
-    "configs/ultralytics/stage2_dawn_rtdetr_from_bdd.yaml",
+    "configs/ultralytics/stage2_xwod_yolov8n_from_bdd.yaml",
+    "configs/ultralytics/stage2_xwod_yolo11n_from_bdd.yaml",
+    "configs/ultralytics/stage2_xwod_rtdetr_from_bdd.yaml",
 ]:
     !python scripts/evaluate.py --config {cfg} --split test
     !python scripts/evaluate_by_weather.py --config {cfg} --split test
 
 !python scripts/evaluate_torchvision.py \
-  --config configs/torchvision/stage2_dawn_faster_rcnn_from_bdd.yaml --split test
-!python scripts/evaluate_torchvision_by_weather.py \
-  --config configs/torchvision/stage2_dawn_faster_rcnn_from_bdd.yaml --split test
+  --config configs/torchvision/stage2_xwod_faster_rcnn_from_bdd.yaml --split test
 ```
 
-### Trên XWOD_held-out (XWOD test, zero-shot từ DAWN model)
+### DAWN_test (held-out — zero-shot từ XWOD model)
 
 ```python
-from ultralytics import YOLO
-RUNS = "/content/drive/MyDrive/adverse_weather_project/runs"
-xwod_data = "/content/xwod_6cls_yolo/dataset.yaml"
+RUNS = f"{DRIVE}/runs"
 
-for run_name in ["stage2_dawn_yolov8n_from_bdd", "stage2_dawn_yolo11n_from_bdd",
-                 "stage2_dawn_rtdetr_from_bdd"]:
+for run_name in [
+    "stage2_xwod_yolov8n_from_bdd",
+    "stage2_xwod_yolo11n_from_bdd",
+    "stage2_xwod_rtdetr_from_bdd",
+]:
+    from ultralytics import YOLO
     model = YOLO(f"{RUNS}/{run_name}/weights/best.pt")
-    model.val(data=xwod_data, split="test", imgsz=640, batch=16,
-              project=f"{RUNS}/{run_name}_on_xwod", name="zeroshot")
+    model.val(data="/content/dawn_6cls_yolo/dataset.yaml", split="test",
+              imgsz=640, batch=16, project=f"{RUNS}/{run_name}_on_dawn", name="zeroshot")
 ```
 
-### Trên BDD_val
+### ACDC_test (zero-shot)
+
+```python
+for run_name in [
+    "stage2_xwod_yolov8n_from_bdd",
+    "stage2_xwod_yolo11n_from_bdd",
+    "stage2_xwod_rtdetr_from_bdd",
+]:
+    model = YOLO(f"{RUNS}/{run_name}/weights/best.pt")
+    model.val(data="/content/acdc_6cls_yolo/dataset.yaml", split="test",
+              imgsz=640, batch=16, project=f"{RUNS}/{run_name}_on_acdc", name="zeroshot")
+```
+
+### BDD_val
 
 ```python
 for cfg in [
@@ -174,117 +196,167 @@ for cfg in [
     !python scripts/evaluate.py --config {cfg} --split val
 ```
 
-Thu thập và so sánh:
+### Thu thập và so sánh
+
 ```python
 !python scripts/collect_results.py --split test
 !python scripts/compare_results.py \
   --input "$DRIVE/runs/val_summary.csv" \
-  --baseline stage2_dawn_yolov8n_from_bdd
+  --baseline stage2_xwod_yolov8n_from_bdd
 ```
 
----
+### Tiêu chí chọn model (theo thứ tự ưu tiên)
 
-## Bước 4 — Chọn model tốt nhất
-
-Tiêu chí (theo mức độ ưu tiên):
-1. **mAP@50-95 trên DAWN_test + XWOD_held-out**
-2. **Recall trong điều kiện thời tiết xấu** (rain, sand, fog)
-3. FPS (inference T4, batch=1)
-4. Số tham số (params)
+1. **mAP@50-95 trên XWOD_test + DAWN_test + ACDC_test** (tổng hợp adverse weather)
+2. **Recall trong điều kiện xấu** (fog, rain, snow, night)
+3. FPS (batch=1, T4)
+4. Số tham số
 5. Độ ổn định trên video thực tế
 
-Dự kiến: YOLOv8n dẫn đầu (đã xác nhận TN1). Nếu ranking đổi với 30K BDD, điều chỉnh stage3 configs tương ứng.
-
 ---
 
-## Bước 5 — Fine-tune sâu model thắng trên XWOD (Stage 3)
+## 5. Phase 2 — Final model training (winner only)
 
-Ví dụ với YOLOv8n (thay tên nếu model khác thắng):
+Ví dụ với YOLOv8n (thay nếu model khác thắng):
 
-```python
-# Stage 3: DAWN_model → XWOD_filtered_train
-!python scripts/train_ultralytics.py \
-  --config configs/ultralytics/stage3_xwod_yolov8n_from_dawn.yaml
-```
-
-**Nếu muốn mixed DAWN+XWOD** (tránh forgetting DAWN):
 ```python
 import yaml, os
 
-# Tạo dataset gộp tại runtime
+# Tạo combined dataset: XWOD + ACDC + BDD replay 20–30%
 merged = {
-    "path": "/content/mixed_adverse",
-    "train": ["/content/xwod_filtered_6cls_yolo/images/train",
-              "/content/dawn_6cls_yolo/images/train"],
-    "val":   ["/content/xwod_filtered_6cls_yolo/images/val",
-              "/content/dawn_6cls_yolo/images/val"],
-    "test":  "/content/xwod_6cls_yolo/images/test",
+    "path": "/content/mixed_final",
+    "train": [
+        "/content/xwod_6cls_yolo/images/train",
+        "/content/acdc_6cls_yolo/images/train",
+        # optional DAWN train:
+        # "/content/dawn_6cls_yolo/images/train",
+    ],
+    "val": [
+        "/content/xwod_6cls_yolo/images/val",
+        "/content/acdc_6cls_yolo/images/val",
+    ],
+    "test": "/content/xwod_6cls_yolo/images/test",
     "names": {0:"person",1:"bicycle",2:"car",3:"motorcycle",4:"bus",5:"truck"},
 }
-os.makedirs("/content/mixed_adverse", exist_ok=True)
-with open("/content/mixed_adverse/dataset.yaml","w") as f:
+os.makedirs("/content/mixed_final", exist_ok=True)
+with open("/content/mixed_final/dataset.yaml", "w") as f:
     yaml.dump(merged, f, sort_keys=False)
-
-# Train với dataset gộp (override dataset trong config)
-from ultralytics import YOLO
-RUNS = "/content/drive/MyDrive/adverse_weather_project/runs"
-ckpt = f"{RUNS}/stage2_dawn_yolov8n_from_bdd/weights/best.pt"
-model = YOLO(ckpt)
-model.train(data="/content/mixed_adverse/dataset.yaml", epochs=30,
-            imgsz=640, lr0=0.0001, project=RUNS, name="stage3_mixed_yolov8n")
 ```
 
-Đánh giá Stage 3 trên DAWN_test + XWOD_test:
 ```python
-!python scripts/evaluate.py \
-  --config configs/ultralytics/stage3_xwod_yolov8n_from_dawn.yaml --split test
-!python scripts/evaluate_by_weather.py \
-  --config configs/ultralytics/stage3_xwod_yolov8n_from_dawn.yaml --split test
+# BDD replay: lấy ~20% BDD training set
+import random, shutil
+from pathlib import Path
+
+bdd_imgs = sorted(Path("/content/bdd100k_6cls_yolo/images/train").glob("*.jpg"))
+random.seed(42)
+replay = random.sample(bdd_imgs, int(len(bdd_imgs) * 0.25))
+
+replay_img_dir = Path("/content/mixed_final/images/replay")
+replay_lbl_dir = Path("/content/mixed_final/labels/replay")
+replay_img_dir.mkdir(parents=True, exist_ok=True)
+replay_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+for img in replay:
+    shutil.copy(img, replay_img_dir / img.name)
+    lbl = Path("/content/bdd100k_6cls_yolo/labels/train") / img.with_suffix(".txt").name
+    if lbl.exists():
+        shutil.copy(lbl, replay_lbl_dir / lbl.name)
+
+# Thêm replay vào merged dataset
+merged["train"].append(str(replay_img_dir))
+with open("/content/mixed_final/dataset.yaml", "w") as f:
+    yaml.dump(merged, f, sort_keys=False)
+```
+
+```python
+# Train Phase 2
+!python scripts/train_ultralytics.py \
+  --config configs/ultralytics/phase2_final_yolov8n_from_xwod.yaml \
+  --data /content/mixed_final/dataset.yaml
 ```
 
 ---
 
-## Bước 6 — Ablation study
+## 6. Phase 2 — Final evaluation
+
+```python
+# XWOD_test
+!python scripts/evaluate.py \
+  --config configs/ultralytics/phase2_final_yolov8n_from_xwod.yaml --split test
+!python scripts/evaluate_by_weather.py \
+  --config configs/ultralytics/phase2_final_yolov8n_from_xwod.yaml --split test
+
+# DAWN_test (zero-shot)
+model = YOLO(f"{RUNS}/phase2_final_yolov8n/weights/best.pt")
+model.val(data="/content/dawn_6cls_yolo/dataset.yaml", split="test",
+          imgsz=640, batch=16, project=f"{RUNS}/phase2_on_dawn", name="final")
+
+# ACDC_test (zero-shot)
+model.val(data="/content/acdc_6cls_yolo/dataset.yaml", split="test",
+          imgsz=640, batch=16, project=f"{RUNS}/phase2_on_acdc", name="final")
+```
+
+---
+
+## 7. Ablation study (winner = YOLOv8n, từ Phase 2 checkpoint)
 
 | ID | Cấu hình | Config |
 |---|---|---|
-| A0 | BDD → DAWN (baseline) | `stage2_dawn_yolov8n_from_bdd` |
-| A1 | A0 → XWOD fine-tune | `stage3_xwod_yolov8n_from_dawn` |
-| A2 | A1 + weather augmentation | `ablation/stage3_xwod_yolov8n_weather_aug` |
-| A3 | A1 + CBAM module | `ablation/stage3_xwod_yolov8n_cbam` |
+| A0 | Phase 1 winner (BDD→XWOD) | `stage2_xwod_yolov8n_from_bdd` |
+| A1 | Phase 2 full (XWOD+ACDC+replay) | `phase2_final_yolov8n_from_xwod` |
+| A2 | A1 + weather augmentation | `ablation/phase2_yolov8n_weather_aug` |
+| A3 | A1 + CBAM module | `ablation/phase2_yolov8n_cbam` |
 
 ```python
-# A2 — Weather aug
+# A2 — Weather augmentation
 !python scripts/train_ultralytics.py \
-  --config configs/ablation/stage3_xwod_yolov8n_weather_aug.yaml
+  --config configs/ablation/phase2_yolov8n_weather_aug.yaml
 
 # A3 — CBAM neck
 !python scripts/train_ultralytics.py \
-  --config configs/ablation/stage3_xwod_yolov8n_cbam.yaml
+  --config configs/ablation/phase2_yolov8n_cbam.yaml
 ```
 
-Đánh giá tất cả trên cùng test set:
+Đánh giá tất cả ablation trên cùng test set:
 ```python
 for cfg in [
-    "configs/ultralytics/stage2_dawn_yolov8n_from_bdd.yaml",       # A0
-    "configs/ultralytics/stage3_xwod_yolov8n_from_dawn.yaml",      # A1
-    "configs/ablation/stage3_xwod_yolov8n_weather_aug.yaml",       # A2
-    "configs/ablation/stage3_xwod_yolov8n_cbam.yaml",              # A3
+    "configs/ultralytics/stage2_xwod_yolov8n_from_bdd.yaml",      # A0
+    "configs/ultralytics/phase2_final_yolov8n_from_xwod.yaml",    # A1
+    "configs/ablation/phase2_yolov8n_weather_aug.yaml",            # A2
+    "configs/ablation/phase2_yolov8n_cbam.yaml",                   # A3
 ]:
     !python scripts/evaluate.py --config {cfg} --split test
     !python scripts/evaluate_by_weather.py --config {cfg} --split test
+```
 
-!python scripts/compare_results.py \
-  --input "$DRIVE/runs/val_summary.csv" \
-  --baseline stage2_dawn_yolov8n_from_bdd
+---
+
+## Metrics cần report
+
+```
+mAP@50, mAP@50-95
+Precision, Recall
+FPS (batch=1, T4), ms/img
+Params
+Per-class AP (6 class)
+Per-weather mAP (fog, rain, snow, night, sand)
+```
+
+Seed stability (vì DAWN nhỏ):
+```python
+!python scripts/run_seeds.py \
+  --config configs/ultralytics/stage2_xwod_yolov8n_from_bdd.yaml \
+  --seeds 0 1 2 --split test
 ```
 
 ---
 
 ## Ghi chú
 
-- DAWN_test (15% = ~210 ảnh) là tập held-out chính — không dùng trong bất kỳ bước train nào.
-- XWOD test là held-out thứ hai — không dùng trong train Stage 3.
-- Stage 3 chỉ train model thắng; các model còn lại dừng ở Stage 2.
-- Ablation (A2, A3) đều khởi đầu từ Stage 2 DAWN checkpoint, không phải Stage 3.
-- `--resume` an toàn cho mọi bước; checkpoint lưu vào Drive sau mỗi epoch.
+- **DAWN_test**: held-out chính — không train bất kỳ bước nào, chỉ evaluate
+- **XWOD_test / ACDC_test**: held-out thứ hai — không dùng trong Phase 2 train
+- Phase 2 chỉ chạy model thắng; 3 model còn lại dừng ở Stage 2
+- Ablation (A2, A3) đều khởi từ Phase 2 checkpoint
+- `--resume` an toàn cho mọi bước; checkpoint tự lưu vào Drive mỗi epoch
+- Xóa run cũ trước khi train lại: `!rm -rf "$DRIVE/runs/stage1_bdd_* $DRIVE/runs/stage2_dawn_*"`

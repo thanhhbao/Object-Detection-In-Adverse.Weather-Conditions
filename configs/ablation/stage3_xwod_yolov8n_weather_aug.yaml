@@ -1,4 +1,0 @@
-variant: weather_aug
-base_config: configs/ultralytics/stage3_xwod_yolov8n_from_dawn.yaml
-augmentation: weather_aug
-name: stage3_xwod_yolov8n_weather_aug

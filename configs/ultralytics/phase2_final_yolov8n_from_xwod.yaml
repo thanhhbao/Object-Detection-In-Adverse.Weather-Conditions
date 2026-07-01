@@ -1,0 +1,11 @@
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_colab.yaml
+
+# Phase 2: winner fine-tune với combined dataset (XWOD + ACDC + optional DAWN replay)
+# Dataset được tạo inline ở Colab (merged yaml) — xem docs/COLAB.md Phase 2
+from_run: stage2_xwod_yolov8n_from_bdd30k
+dataset: xwod  # override at runtime với combined dataset path
+name: phase2_final_yolov8n
+
+lr0: 0.00005
+patience: 20

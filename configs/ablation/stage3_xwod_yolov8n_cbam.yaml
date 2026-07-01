@@ -1,4 +1,0 @@
-variant: cbam
-base_config: configs/ultralytics/stage3_xwod_yolov8n_from_dawn.yaml
-model_yaml: models/yolov8n_cbam_neck.yaml
-name: stage3_xwod_yolov8n_cbam

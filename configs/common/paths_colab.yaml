@@ -2,7 +2,9 @@ drive_root: /content/drive/MyDrive/adverse_weather_project
 project: /content/drive/MyDrive/adverse_weather_project/runs
 
 datasets:
-  bdd: /content/bdd100k_6cls_yolo/dataset.yaml
+  bdd_6cls_30k: /content/bdd100k_6cls_30k_yolo/dataset.yaml
+  bdd_6cls_full: /content/bdd100k_6cls_full_yolo/dataset.yaml
   dawn: /content/dawn_6cls_yolo/dataset.yaml
   xwod: /content/xwod_6cls_yolo/dataset.yaml
+  acdc: /content/acdc_6cls_yolo/dataset.yaml
 

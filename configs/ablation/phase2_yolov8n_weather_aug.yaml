@@ -1,0 +1,4 @@
+variant: weather_aug
+base_config: configs/ultralytics/phase2_final_yolov8n_from_xwod.yaml
+augmentation: weather_aug
+name: phase2_yolov8n_weather_aug

@@ -1,14 +1,14 @@
 defaults: configs/common/train_defaults.yaml
 paths: configs/common/paths_colab.yaml
 
-model: fasterrcnn_resnet50_fpn
-weights: COCO_V1
-dataset: bdd
-name: stage1_bdd_faster_rcnn
+from_run: stage1_bdd30k_faster_rcnn
+checkpoint_file: best.pth
+dataset: xwod
+name: stage2_xwod_faster_rcnn_from_bdd30k
 
 epochs: 30
 batch: 4
 optimizer: SGD
-lr0: 0.005
+lr0: 0.0025
 momentum: 0.9
 num_classes: 7
