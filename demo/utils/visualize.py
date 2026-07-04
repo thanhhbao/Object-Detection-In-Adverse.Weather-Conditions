@@ -8,24 +8,24 @@ from PIL import Image
 
 CLASSES = ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
 
-# Vibrant colors per class (BGR for OpenCV)
+# Colors per class — Tailwind palette (BGR for OpenCV)
 CLASS_COLORS_BGR: dict[int, tuple[int, int, int]] = {
-    0: (75,  105, 255),   # person     → red-orange
-    1: (75,  205, 78),    # bicycle    → green
-    2: (210, 175, 55),    # car        → blue
-    3: (120, 100, 230),   # motorcycle → purple
-    4: (55,  215, 255),   # bus        → yellow
-    5: (200, 100, 220),   # truck      → pink
+    0: (68,  68,  239),   # person     → red     #ef4444
+    1: (94,  197, 34),    # bicycle    → green   #22c55e
+    2: (246, 130, 59),    # car        → blue    #3b82f6
+    3: (247, 85,  168),   # motorcycle → purple  #a855f7
+    4: (8,   179, 234),   # bus        → yellow  #eab308
+    5: (153, 72,  236),   # truck      → pink    #ec4899
 }
 
-# RGB versions for display
+# Hex versions for display (match app.py home page)
 CLASS_COLORS_HEX: dict[int, str] = {
-    0: "#FF6B4B",
-    1: "#4ECD4E",
-    2: "#37AFEE",
-    3: "#E664E6",
-    4: "#FFD737",
-    5: "#DC64DC",
+    0: "#ef4444",
+    1: "#22c55e",
+    2: "#3b82f6",
+    3: "#a855f7",
+    4: "#eab308",
+    5: "#ec4899",
 }
 
 

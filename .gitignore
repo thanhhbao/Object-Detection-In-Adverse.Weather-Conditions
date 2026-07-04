@@ -20,3 +20,4 @@ runs/*
 # Report figures (generated locally)
 docs/thesis/figures/
 demo/.streamlit/secrets.toml
+demo/.venv/
