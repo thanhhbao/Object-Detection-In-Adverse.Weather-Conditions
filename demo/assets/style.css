@@ -1,0 +1,230 @@
+/* ── Global ── */
+[data-testid="stAppViewContainer"] {
+    background: linear-gradient(135deg, #0b0e1a 0%, #0f1525 100%);
+}
+
+[data-testid="stSidebar"] {
+    background: #0d1020;
+    border-right: 1px solid #1e2340;
+}
+
+/* ── Hide default Streamlit chrome ── */
+#MainMenu, footer, header { visibility: hidden; }
+
+/* ── Hero section ── */
+.hero {
+    background: linear-gradient(135deg, #0f1f3d 0%, #1a0a2e 50%, #0d1f3d 100%);
+    border: 1px solid #1e3a5f;
+    border-radius: 16px;
+    padding: 2.5rem 3rem;
+    margin-bottom: 2rem;
+    position: relative;
+    overflow: hidden;
+}
+
+.hero::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: radial-gradient(circle, rgba(0,212,255,0.04) 0%, transparent 60%);
+    pointer-events: none;
+}
+
+.hero-title {
+    font-size: 2.4rem;
+    font-weight: 800;
+    background: linear-gradient(90deg, #00d4ff, #7b61ff, #00d4ff);
+    background-size: 200%;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0.5rem;
+    line-height: 1.2;
+}
+
+.hero-subtitle {
+    font-size: 1rem;
+    color: #8892b0;
+    margin-bottom: 1.5rem;
+}
+
+/* ── Metric cards ── */
+.metric-row {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+}
+
+.metric-card {
+    background: #141828;
+    border: 1px solid #1e2a4a;
+    border-radius: 12px;
+    padding: 1.2rem 1.5rem;
+    flex: 1;
+    min-width: 140px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.2s;
+}
+
+.metric-card:hover { border-color: #00d4ff44; }
+
+.metric-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, #00d4ff, #7b61ff);
+}
+
+.metric-value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: #00d4ff;
+    line-height: 1;
+    margin-bottom: 0.3rem;
+}
+
+.metric-label {
+    font-size: 0.75rem;
+    color: #6b7394;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+/* ── Upload area ── */
+[data-testid="stFileUploader"] {
+    border: 2px dashed #1e2a4a;
+    border-radius: 12px;
+    background: #0f1320;
+    transition: border-color 0.2s;
+}
+
+[data-testid="stFileUploader"]:hover {
+    border-color: #00d4ff55;
+}
+
+/* ── Detect button ── */
+.stButton > button {
+    background: linear-gradient(135deg, #00d4ff, #0099bb);
+    color: #000;
+    border: none;
+    border-radius: 10px;
+    font-weight: 700;
+    font-size: 1rem;
+    padding: 0.6rem 2rem;
+    width: 100%;
+    transition: all 0.2s;
+    letter-spacing: 0.03em;
+}
+
+.stButton > button:hover {
+    background: linear-gradient(135deg, #33ddff, #00bbdd);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 20px rgba(0, 212, 255, 0.3);
+}
+
+.stButton > button:active { transform: translateY(0); }
+
+/* ── Result image container ── */
+.result-container {
+    background: #0f1320;
+    border: 1px solid #1e2a4a;
+    border-radius: 12px;
+    padding: 1rem;
+    margin-top: 1rem;
+}
+
+.result-header {
+    font-size: 0.75rem;
+    color: #6b7394;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 0.5rem;
+}
+
+/* ── Detection table ── */
+.detection-table {
+    background: #0f1320;
+    border: 1px solid #1e2a4a;
+    border-radius: 12px;
+    padding: 1rem 1.5rem;
+    margin-top: 1rem;
+}
+
+/* ── Class badge ── */
+.class-badge {
+    display: inline-block;
+    padding: 0.2rem 0.7rem;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    margin: 2px;
+}
+
+/* ── Info card ── */
+.info-card {
+    background: #141828;
+    border: 1px solid #1e2a4a;
+    border-radius: 12px;
+    padding: 1.2rem 1.5rem;
+    margin-bottom: 1rem;
+}
+
+.info-card h4 {
+    color: #00d4ff;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 0.8rem;
+}
+
+/* ── Progress / spinner ── */
+.stSpinner > div {
+    border-top-color: #00d4ff !important;
+}
+
+/* ── Tabs ── */
+[data-testid="stTabs"] [role="tab"] {
+    font-weight: 600;
+    color: #6b7394;
+}
+
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+    color: #00d4ff;
+    border-bottom-color: #00d4ff;
+}
+
+/* ── Sidebar elements ── */
+.sidebar-section {
+    background: #141828;
+    border: 1px solid #1e2a4a;
+    border-radius: 10px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+}
+
+.sidebar-title {
+    font-size: 0.7rem;
+    color: #6b7394;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 0.8rem;
+}
+
+/* ── Weather badge ── */
+.weather-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: #1a2540;
+    border: 1px solid #2a3a60;
+    border-radius: 20px;
+    padding: 0.3rem 0.9rem;
+    font-size: 0.8rem;
+    color: #a8b4d0;
+    margin-top: 0.5rem;
+}
