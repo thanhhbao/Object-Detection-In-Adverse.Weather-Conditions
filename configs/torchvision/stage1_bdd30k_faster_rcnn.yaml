@@ -6,7 +6,7 @@ weights: COCO_V1
 dataset: bdd_6cls_30k
 name: stage1_bdd30k_faster_rcnn
 
-epochs: 30
+epochs: 10
 batch: 4
 optimizer: SGD
 lr0: 0.005
