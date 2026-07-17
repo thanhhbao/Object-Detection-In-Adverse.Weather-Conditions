@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--weights", default=None)
     parser.add_argument("--name", default=None)
+    parser.add_argument("--data", default=None,
+                        help="Override the dataset YAML path (e.g. Phase 2 merged dataset).")
     parser.add_argument("--seed", type=int, default=None, help="Override seed for multi-seed runs.")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -60,6 +62,8 @@ def load_train_config(args: argparse.Namespace) -> dict:
         config["model"] = args.weights
     if args.name:
         config["name"] = args.name
+    if args.data:
+        config["data"] = resolve_config_path(args.data)
     if args.seed is not None:
         config["seed"] = args.seed
     return config
