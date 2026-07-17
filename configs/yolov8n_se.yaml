@@ -1,0 +1,41 @@
+# YOLOv8n + a SINGLE Squeeze-and-Excitation block inserted right after SPPF.
+#
+# This is the +SE ablation model. The ONLY architectural difference vs
+# models/yolov8n_baseline.yaml is one SEResearch layer (index 10) after SPPF —
+# so it isolates the effect of a single attention block (one variable).
+#
+# Because SE is inserted at backbone index 10, every head index shifts by +1 and
+# the layers that consumed the SPPF output (index 9) now consume the SE output
+# (index 10). scripts/train.py transfers pretrained weights by pairing non-attention
+# layers in order and skipping the inserted SE layer.
+nc: 6
+
+# 0 person  1 bicycle  2 car  3 motorcycle  4 bus  5 truck
+
+backbone:
+  - [-1, 1, Conv, [16, 3, 2]]        # 0
+  - [-1, 1, Conv, [32, 3, 2]]        # 1
+  - [-1, 1, C2f, [32, true]]         # 2
+  - [-1, 1, Conv, [64, 3, 2]]        # 3
+  - [-1, 2, C2f, [64, true]]         # 4   (P3)
+  - [-1, 1, Conv, [128, 3, 2]]       # 5
+  - [-1, 2, C2f, [128, true]]        # 6   (P4)
+  - [-1, 1, Conv, [256, 3, 2]]       # 7
+  - [-1, 1, C2f, [256, true]]        # 8
+  - [-1, 1, SPPF, [256, 5]]          # 9
+  - [-1, 1, SEResearch, [256, 16]]   # 10  <-- single SE after SPPF (P5 refined)
+
+head:
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]  # 11
+  - [[-1, 6], 1, Concat, [1]]                 # 12
+  - [-1, 1, C2f, [128]]                       # 13
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]  # 14
+  - [[-1, 4], 1, Concat, [1]]                 # 15
+  - [-1, 1, C2f, [64]]                        # 16  (P3/8 out)
+  - [-1, 1, Conv, [64, 3, 2]]                 # 17
+  - [[-1, 13], 1, Concat, [1]]                # 18
+  - [-1, 1, C2f, [128]]                       # 19  (P4/16 out)
+  - [-1, 1, Conv, [128, 3, 2]]                # 20
+  - [[-1, 10], 1, Concat, [1]]                # 21  (concat with SE output)
+  - [-1, 1, C2f, [256]]                       # 22  (P5/32 out)
+  - [[16, 19, 22], 1, Detect, [nc]]           # 23

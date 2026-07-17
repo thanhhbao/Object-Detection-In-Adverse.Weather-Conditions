@@ -1,0 +1,16 @@
+# XWOD 6-class data config for the +SE ablation.
+# The ablation trains on XWOD (same data as the baseline) so the only variable is SE.
+# Adjust `path` for your environment (Colab: /content/workspace, Vast: /workspace).
+path: /content/workspace/datasets/xwod_6cls_yolo
+train: images/train
+val: images/val
+test: images/test
+
+nc: 6
+names:
+  0: person
+  1: bicycle
+  2: car
+  3: motorcycle
+  4: bus
+  5: truck

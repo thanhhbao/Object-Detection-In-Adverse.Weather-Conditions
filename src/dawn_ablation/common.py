@@ -105,6 +105,7 @@ def register_custom_modules() -> None:
     """Expose local modules to Ultralytics' YAML parser before model creation."""
     from ultralytics.nn import tasks
 
-    from dawn_ablation.attention import CBAMResearch
+    from dawn_ablation.attention import CBAMResearch, SEResearch
 
     tasks.CBAMResearch = CBAMResearch
+    tasks.SEResearch = SEResearch

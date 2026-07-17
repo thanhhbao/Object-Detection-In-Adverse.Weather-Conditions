@@ -6,6 +6,29 @@ import torch
 from torch import nn
 
 
+class SEResearch(nn.Module):
+    """Squeeze-and-Excitation channel attention (eager, shape-preserving).
+
+    A single lightweight attention block used for the +SE ablation. Built entirely
+    in __init__ (no lazy modules) so every parameter exists before the optimizer is
+    created and is therefore included in training.
+    """
+
+    def __init__(self, channels: int, reduction: int = 16) -> None:
+        super().__init__()
+        hidden = max(channels // reduction, 1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.fc(self.avg_pool(x))
+
+
 class ChannelAttention(nn.Module):
     """CBAM channel attention using shared MLP weights."""
 
