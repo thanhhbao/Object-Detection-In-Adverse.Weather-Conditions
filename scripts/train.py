@@ -131,7 +131,10 @@ def main() -> None:
         cos_lr=True,
         deterministic=True,
         amp=True,
-        pretrained=False,     # weights already transferred
+        # IMPORTANT: must be True. In Ultralytics, pretrained=False sets weights=None
+        # in the trainer and the transferred weights are DISCARDED (trains from scratch).
+        # True keeps our already-transferred model as the training start point.
+        pretrained=True,
         project=args.project,
         name=args.name,
         exist_ok=True,
