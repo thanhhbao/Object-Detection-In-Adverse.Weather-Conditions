@@ -10,6 +10,9 @@ secondary experiment** only.
 - A single `SEResearch` block is inserted **right after SPPF** (`configs/yolov8n_se.yaml`).
   Everything else is identical to `models/yolov8n_baseline.yaml`.
 - SE is **eager** (all params built in `__init__`) so they are in the optimizer.
+- SE uses **identity init** (last conv zero-init + positive bias → gate ≈ 0.95 at start),
+  so pretrained features pass through almost unchanged and SE learns to modulate gradually.
+  Without this, a random sigmoid ≈ 0.5 halves the P5 features and wrecks the pretrained head.
 - Adds ~8k params (`SE(256, r=16)`), negligible vs the 3.0M baseline.
 - Trained on **XWOD** — the same data as the baseline — so the only variable is SE.
   (The final best model uses the merged Phase-2 dataset; the ablation stays on XWOD.)
