@@ -1,39 +1,29 @@
 #!/usr/bin/env python3
-"""Prepare ACDC dataset for YOLO training.
+"""Prepare ACDC dataset for YOLO training (6-class project format).
 
-ACDC cung cấp panoptic segmentation theo COCO panoptic format (JSON + PNG mask).
-Script này convert mask → tight bbox → YOLO format, áp dụng class mapping sau:
+Iterates over the RGB images and reads the matching ground-truth mask per image.
+ACDC train + val are used (test has no public GT). ACDC's own train/val split is
+PRESERVED (train→train, val→val) — no re-stratification.
 
-  person     → person (0)
-  rider      → person (0)   # consistent với BDD100K mapping
-  car        → car    (2)
-  truck      → truck  (5)
-  bus        → bus    (4)
-  motorcycle → motorcycle (3)
-  bicycle    → bicycle (1)
-  train / traffic light / sign / stuff → ignore
+Supported raw layout (auto-detected):
+  <raw-dir>/rgb_anon/{fog,night,rain,snow}/{train,val}/<sequence>/*_rgb_anon.png
+  <raw-dir>/gt_panoptic/{fog,night,rain,snow}/{train,val}/<sequence>/*_gt_panoptic.png
+  (also supports gt/panoptic/... , and *_gt_instanceIds.png / *_gt_labelIds.png)
 
-ACDC structure (mặc định):
-  <raw-dir>/
-    rgb_anon/
-      fog/train/<city>/<img>.png
-      night/train/<city>/<img>.png
-      rain/train/<city>/<img>.png
-      snow/train/<city>/<img>.png
-    gt/
-      panoptic/
-        fog/train/panoptic_fog_train.json
-              └── <city>/<img>_gt_panoptic.png
-        night/train/panoptic_night_train.json
-        rain/train/panoptic_rain_train.json
-        snow/train/panoptic_snow_train.json
-      (val/test cùng cấu trúc)
+Label decoding priority (per image):
+  1. *_gt_instanceIds.png  — Cityscapes instance ids (id = labelId*1000 + inst). JSON-free.
+  2. *_gt_panoptic.png + COCO panoptic JSON (segments_info)  — if a JSON is present.
+  3. *_gt_panoptic.png alone — decoded as instance ids (best-effort, warns once).
 
-Ví dụ:
+Class mapping (Cityscapes labelId → project class):
+  24 person, 25 rider→person, 26 car, 27 truck, 28 bus, 31 train→ignore,
+  32 motorcycle, 33 bicycle.  Fixed order: person,bicycle,car,motorcycle,bus,truck.
+
+Example:
   python scripts/prepare_acdc.py \\
-    --raw-dir /content/acdc \\
-    --output-dir /content/acdc_6cls_yolo \\
-    --imgsz 640 --seed 42
+    --raw-dir /workspace/datasets/acdc_raw \\
+    --output-dir /workspace/datasets/acdc_6cls_yolo \\
+    --imgsz 640 --seed 42 --clean
 """
 
 from __future__ import annotations
@@ -41,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -49,192 +40,188 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from dawn_ablation.data_prep import (
+from dawn_ablation.data_prep import (  # noqa: E402
     Box,
     PreparedSample,
     TARGET_CLASSES,
-    clean_output_dir,
     clamp_box,
+    clean_output_dir,
     export_yolo_dataset,
     make_yolo_dirs,
-    stratified_split,
+    normalize_class,
 )
 
-# ---------------------------------------------------------------------------
-# Cityscapes category_id → class name (chỉ các class cần thiết)
-# ---------------------------------------------------------------------------
-
-# Cityscapes trainId mapping (dùng trong ACDC panoptic JSON)
-# category_id trong JSON có thể là trainId hoặc id tùy version ACDC
-# Script hỗ trợ cả hai qua dict này (key = category_id từ JSON)
-CITYSCAPES_ID_TO_NAME: dict[int, str | None] = {
-    # things — các class quan tâm
-    24: "person",
-    25: "rider",     # → person qua CLASS_ALIASES
-    26: "car",
-    27: "truck",
-    28: "bus",
-    31: "train",     # → None (ignore)
-    32: "motorcycle",
-    33: "bicycle",
-    # stuff và classes khác → None (ignore)
+# Cityscapes labelId → name (things we care about; others ignored)
+CITYSCAPES_ID_TO_NAME: dict[int, str] = {
+    24: "person", 25: "rider", 26: "car", 27: "truck",
+    28: "bus", 31: "train", 32: "motorcycle", 33: "bicycle",
 }
-
 WEATHER_CONDITIONS = ["fog", "night", "rain", "snow"]
+_WARNED = {"panoptic_guess": False}
 
 
 # ---------------------------------------------------------------------------
-# Panoptic mask decoder
+# Mask decoding
 # ---------------------------------------------------------------------------
 
 
-def decode_panoptic_mask(mask_path: Path) -> np.ndarray:
-    """Đọc COCO panoptic PNG và trả về array segment_id per pixel (H, W)."""
-    mask = np.array(Image.open(mask_path).convert("RGB"), dtype=np.int32)
-    # COCO panoptic encoding: segment_id = R + G*256 + B*65536
-    return mask[:, :, 0] + mask[:, :, 1] * 256 + mask[:, :, 2] * 65536
+def _read_id_map(mask_path: Path) -> np.ndarray:
+    """Read a mask PNG as a 2D integer id map (H, W)."""
+    arr = np.array(Image.open(mask_path))
+    if arr.ndim == 3:  # RGB-encoded id: r + g*256 + b*65536
+        arr = arr.astype(np.int64)
+        return arr[:, :, 0] + arr[:, :, 1] * 256 + arr[:, :, 2] * 65536
+    return arr.astype(np.int64)
 
 
-def segment_to_bbox(seg_mask: np.ndarray) -> tuple[int, int, int, int] | None:
-    """Tính tight bbox (x1, y1, x2, y2) từ boolean mask."""
+def segment_to_bbox(seg_mask: np.ndarray):
     rows = np.any(seg_mask, axis=1)
     cols = np.any(seg_mask, axis=0)
     if not rows.any():
         return None
     y1, y2 = int(np.where(rows)[0][0]), int(np.where(rows)[0][-1])
     x1, x2 = int(np.where(cols)[0][0]), int(np.where(cols)[0][-1])
-    return x1, y1, x2 + 1, y2 + 1  # x2/y2 exclusive
+    return x1, y1, x2 + 1, y2 + 1
+
+
+def boxes_from_instance_ids(id_map: np.ndarray) -> list[Box]:
+    """Cityscapes instance ids: id = labelId*1000 + inst (things), or labelId (stuff)."""
+    h, w = id_map.shape
+    boxes: list[Box] = []
+    for sid in np.unique(id_map):
+        sid = int(sid)
+        label_id = sid // 1000 if sid >= 1000 else sid
+        name = CITYSCAPES_ID_TO_NAME.get(label_id)
+        if name is None:
+            continue
+        bbox = segment_to_bbox(id_map == sid)
+        if bbox is None:
+            continue
+        box = clamp_box(name, *bbox, w, h)
+        if box is not None:
+            boxes.append(box)
+    return boxes
+
+
+def boxes_from_panoptic_json(id_map: np.ndarray, segments, cat_lookup) -> list[Box]:
+    """COCO panoptic: sequential segment ids in PNG, class from JSON segments_info."""
+    h, w = id_map.shape
+    boxes: list[Box] = []
+    for seg in segments:
+        name = cat_lookup.get(seg.get("category_id"))
+        if name is None:
+            continue
+        bbox = segment_to_bbox(id_map == seg.get("id"))
+        if bbox is None:
+            continue
+        box = clamp_box(name, *bbox, w, h)
+        if box is not None:
+            boxes.append(box)
+    return boxes
 
 
 # ---------------------------------------------------------------------------
-# Đọc một split của một điều kiện thời tiết
+# Locate GT + optional panoptic JSON
 # ---------------------------------------------------------------------------
 
 
-def load_acdc_split(
-    raw_dir: Path,
-    condition: str,
-    split: str,
-) -> list[PreparedSample]:
-    """Load tất cả ảnh từ một condition/split, convert panoptic → bbox."""
-    panoptic_json = (
-        raw_dir / "gt" / "panoptic" / condition / split
-        / f"panoptic_{condition}_{split}.json"
-    )
-    if not panoptic_json.exists():
-        print(f"  [SKIP] không tìm thấy JSON: {panoptic_json}")
+def find_gt_root(raw_dir: Path) -> Path | None:
+    for cand in (raw_dir / "gt_panoptic", raw_dir / "gt" / "panoptic", raw_dir / "gt"):
+        if cand.exists():
+            return cand
+    return None
+
+
+def build_json_lookup(gt_split_dir: Path):
+    """If COCO panoptic JSON(s) exist under the split dir, index segments by image stem."""
+    lookup: dict[str, list] = {}
+    cats: dict[int, str | None] = dict(CITYSCAPES_ID_TO_NAME)
+    if not gt_split_dir.exists():
+        return lookup, cats
+    for jp in gt_split_dir.rglob("*.json"):
+        try:
+            data = json.loads(jp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for cat in data.get("categories", []):
+            cid = cat.get("id")
+            nm = str(cat.get("name", "")).lower().strip()
+            if cid not in cats:
+                cats[cid] = nm if (normalize_class(nm) or nm in {"rider", "train"}) else None
+        for ann in data.get("annotations", []):
+            key = Path(ann.get("file_name", "")).stem.replace("_rgb_anon", "").replace("_gt_panoptic", "")
+            if key:
+                lookup[key] = ann.get("segments_info", [])
+    return lookup, cats
+
+
+# ---------------------------------------------------------------------------
+# Load one condition/split
+# ---------------------------------------------------------------------------
+
+
+def load_split(raw_dir: Path, gt_root: Path, condition: str, split: str) -> list[PreparedSample]:
+    img_root = raw_dir / "rgb_anon" / condition / split
+    gt_split = gt_root / condition / split
+    if not img_root.exists():
+        print(f"  [SKIP] no RGB dir: {img_root}")
         return []
 
-    data = json.loads(panoptic_json.read_text(encoding="utf-8"))
-
-    # Xây category_id lookup từ JSON (nếu có categories block)
-    cat_lookup: dict[int, str | None] = dict(CITYSCAPES_ID_TO_NAME)
-    if "categories" in data:
-        for cat in data["categories"]:
-            cid = cat["id"]
-            name = cat.get("name", "").lower().strip()
-            if cid not in cat_lookup:
-                cat_lookup[cid] = name if name in {c for c in TARGET_CLASSES} | {"rider", "train"} else None
-
-    mask_root = raw_dir / "gt" / "panoptic" / condition / split
-    img_root = raw_dir / "rgb_anon" / condition / split
-
+    json_lookup, cat_lookup = build_json_lookup(gt_split)
     samples: list[PreparedSample] = []
-    skipped = {"no_image": 0, "no_mask": 0, "no_boxes": 0}
+    skipped = Counter()
 
-    for ann in data.get("annotations", []):
-        # Tìm file ảnh
-        file_name = ann.get("file_name", "")  # e.g. "GOPR0351_frame_000001_rgb_anon.png"
-        img_stem = Path(file_name).stem.replace("_rgb_anon", "")
-        # Tìm ảnh trong cây thư mục (có thể có subfolder city)
-        img_candidates = list(img_root.rglob(f"*{img_stem}*.png"))
-        if not img_candidates:
-            skipped["no_image"] += 1
-            continue
-        image_path = img_candidates[0]
+    for img in sorted(img_root.rglob("*_rgb_anon.png")):
+        seq = img.parent.name
+        base = img.name.replace("_rgb_anon.png", "")
+        key = img.stem.replace("_rgb_anon", "")
 
-        # Tìm mask PNG (tên tương ứng với panoptic_file_name trong ann)
-        mask_file = ann.get("panoptic_file_name", "")
-        if not mask_file:
-            # fallback: tên ảnh nhưng đổi suffix
-            mask_file = Path(file_name).stem + "_gt_panoptic.png"
-        mask_candidates = list(mask_root.rglob(f"*{Path(mask_file).stem}*"))
-        if not mask_candidates:
-            skipped["no_mask"] += 1
-            continue
-        mask_path = mask_candidates[0]
-
-        try:
-            seg_map = decode_panoptic_mask(mask_path)
-            img_h, img_w = seg_map.shape
-        except Exception:
-            skipped["no_mask"] += 1
-            continue
+        inst = gt_split / seq / f"{base}_gt_instanceIds.png"
+        pano = gt_split / seq / f"{base}_gt_panoptic.png"
 
         boxes: list[Box] = []
-        for seg_info in ann.get("segments_info", []):
-            cat_id = seg_info.get("category_id")
-            seg_id = seg_info.get("id")
-            class_name = cat_lookup.get(cat_id)
-            if class_name is None:
-                continue
-
-            pixel_mask = seg_map == seg_id
-            bbox = segment_to_bbox(pixel_mask)
-            if bbox is None:
-                continue
-
-            x1, y1, x2, y2 = bbox
-            box = clamp_box(class_name, x1, y1, x2, y2, img_w, img_h)
-            if box is not None:
-                boxes.append(box)
+        if inst.exists():                                  # 1. instance ids (best)
+            boxes = boxes_from_instance_ids(_read_id_map(inst))
+        elif pano.exists() and key in json_lookup:         # 2. panoptic + JSON
+            boxes = boxes_from_panoptic_json(_read_id_map(pano), json_lookup[key], cat_lookup)
+        elif pano.exists():                                # 3. panoptic alone (best-effort)
+            if not _WARNED["panoptic_guess"]:
+                print("  [WARN] no instanceIds/JSON — decoding *_gt_panoptic.png as instance ids. "
+                      "Verify the box counts below look sane.")
+                _WARNED["panoptic_guess"] = True
+            boxes = boxes_from_instance_ids(_read_id_map(pano))
+        else:
+            skipped["no_mask"] += 1
+            continue
 
         if not boxes:
             skipped["no_boxes"] += 1
             continue
 
-        samples.append(
-            PreparedSample(
-                image=image_path,
-                boxes=tuple(boxes),
-                split_key=f"{condition}_{split}",
-                source="acdc",
-                weather=condition,
-            )
-        )
+        samples.append(PreparedSample(
+            image=img, boxes=tuple(boxes), split_key=split, source="acdc", weather=condition,
+        ))
 
-    if any(skipped.values()):
-        print(f"  [{condition}/{split}] skipped: {skipped}")
+    if skipped:
+        print(f"  [{condition}/{split}] skipped: {dict(skipped)}")
     return samples
 
 
 # ---------------------------------------------------------------------------
-# Parse args
+# CLI / main
 # ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--raw-dir", type=Path, required=True,
-                        help="Root ACDC directory (chứa rgb_anon/ và gt/)")
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--conditions", type=str, default="all",
-        help="Comma-separated: fog,rain,snow,night hoặc 'all'",
-    )
-    parser.add_argument(
-        "--splits", type=str, default="train,val,test",
-        help="Comma-separated list of ACDC splits to load (default: train,val,test)",
-    )
-    parser.add_argument("--clean", action="store_true")
-    return parser.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    p = argparse.ArgumentParser()
+    p.add_argument("--raw-dir", type=Path, required=True, help="ACDC root (has rgb_anon/ and gt_panoptic/)")
+    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--conditions", type=str, default="all", help="fog,rain,snow,night or 'all'")
+    p.add_argument("--splits", type=str, default="train,val", help="ACDC splits to use (default train,val)")
+    p.add_argument("--clean", action="store_true")
+    return p.parse_args()
 
 
 def main() -> None:
@@ -242,33 +229,45 @@ def main() -> None:
     raw_dir = args.raw_dir.resolve()
     output_dir = args.output_dir.resolve()
 
-    conditions = WEATHER_CONDITIONS if args.conditions == "all" else [
-        c.strip() for c in args.conditions.split(",")
-    ]
-    acdc_splits = [s.strip() for s in args.splits.split(",")]
+    gt_root = find_gt_root(raw_dir)
+    if gt_root is None:
+        raise RuntimeError(f"No GT dir found under {raw_dir} (looked for gt_panoptic/, gt/panoptic/, gt/).")
+    print(f"GT root: {gt_root}")
+
+    conditions = WEATHER_CONDITIONS if args.conditions == "all" else [c.strip() for c in args.conditions.split(",")]
+    splits = [s.strip() for s in args.splits.split(",")]
 
     clean_output_dir(output_dir, args.clean)
-    make_yolo_dirs(output_dir, splits=("train", "val", "test"))
+    make_yolo_dirs(output_dir, splits=tuple(splits))
 
     all_samples: list[PreparedSample] = []
+    assignments: dict[int, str] = {}
     for condition in conditions:
-        for acdc_split in acdc_splits:
-            print(f"Loading {condition}/{acdc_split}...")
-            samples = load_acdc_split(raw_dir, condition, acdc_split)
-            print(f"  → {len(samples)} ảnh hợp lệ")
-            all_samples.extend(samples)
+        for split in splits:
+            print(f"Loading {condition}/{split}...")
+            found = load_split(raw_dir, gt_root, condition, split)
+            print(f"  → {len(found)} images with boxes")
+            for s in found:
+                assignments[len(all_samples)] = split   # preserve ACDC split
+                all_samples.append(s)
 
     if not all_samples:
-        raise RuntimeError("Không tìm thấy ảnh nào. Kiểm tra --raw-dir và cấu trúc thư mục ACDC.")
+        raise RuntimeError(
+            "No labelled images found. Check --raw-dir and that GT masks/JSON exist.\n"
+            "Run the diagnostic in docs/PHASE2_DATASET.md / ask if box decoding failed."
+        )
 
-    print(f"\nTổng: {len(all_samples)} ảnh. Đang chia train/val/test (stratified theo weather)...")
-    assignments = stratified_split(
-        all_samples,
-        seed=args.seed,
-        train_ratio=0.70,
-        val_ratio=0.15,
-        stratify_attr="weather",
-    )
+    # Sanity report: boxes per class + images per split
+    class_counter: Counter = Counter()
+    split_counter: Counter = Counter()
+    for i, s in enumerate(all_samples):
+        split_counter[assignments[i]] += 1
+        for b in s.boxes:
+            class_counter[TARGET_CLASSES[b.class_id]] += 1
+    print(f"\nImages per split: {dict(split_counter)}")
+    print("Boxes per class:")
+    for c in TARGET_CLASSES:
+        print(f"  {c:<12}{class_counter.get(c, 0)}")
 
     export_yolo_dataset(
         samples=all_samples,
@@ -276,7 +275,7 @@ def main() -> None:
         raw_root=raw_dir,
         output_dir=output_dir,
         imgsz=args.imgsz,
-        splits=("train", "val", "test"),
+        splits=tuple(splits),
     )
 
 
