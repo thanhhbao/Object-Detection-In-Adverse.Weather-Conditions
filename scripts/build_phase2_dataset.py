@@ -138,7 +138,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--acdc-root", type=Path, default=None, help="Optional — skipped if missing")
     ap.add_argument("--out-root", type=Path, required=True)
     ap.add_argument("--bdd-replay-ratio", type=float, default=0.3,
-                    help="Fraction of BDD30K train to replay (default 0.3)")
+                    help="Fraction of BDD30K train to replay (default 0.3). NOTE: 0.3*30000=9000 "
+                         "can dominate the merge — prefer --bdd-replay-images for a small minority.")
+    ap.add_argument("--bdd-replay-images", type=int, default=None,
+                    help="Absolute number of BDD replay images (overrides --bdd-replay-ratio). "
+                         "Recommended ~2000-2500 so BDD stays a minority.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--mode", choices=["symlink", "copy"], default="symlink")
     ap.add_argument("--clean", action="store_true", help="Remove --out-root if it exists")
@@ -182,15 +186,28 @@ def main() -> None:
         images_per_source["acdc_train"] = 0
         print("ACDC not found — building XWOD + BDD replay only.")
 
-    # ── 3. BDD30K train replay (sampled fraction) ──
+    # ── 3. BDD30K train replay (anti-forgetting minority) ──
+    # Replay is meant to be a SMALL minority so it doesn't drown the adverse-weather
+    # data. Prefer an absolute count (--bdd-replay-images); the ratio is a fraction of
+    # BDD30K and can easily overshoot (0.3 * 30000 = 9000, which dominates the merge).
     bdd_all = list_pairs(args.bdd_root.resolve(), "train")
     rng.shuffle(bdd_all)
-    n_replay = int(round(len(bdd_all) * args.bdd_replay_ratio))
+    if args.bdd_replay_images is not None:
+        n_replay = args.bdd_replay_images
+    else:
+        n_replay = int(round(len(bdd_all) * args.bdd_replay_ratio))
+    n_replay = min(n_replay, len(bdd_all))
     bdd_replay = bdd_all[:n_replay]
     images_per_source["bdd_replay"] = write_split(
         bdd_replay, "bdd_", "bdd", "train",
         out_train_img, out_train_lbl, args.mode, manifest_rows, class_counter,
     )
+
+    adverse = images_per_source["xwod_train"] + images_per_source["acdc_train"]
+    if images_per_source["bdd_replay"] > adverse:
+        print(f"\n  [WARN] BDD replay ({images_per_source['bdd_replay']}) exceeds adverse-weather "
+              f"images ({adverse}). Clear-weather BDD dominates the merge and will dilute the "
+              f"adverse-weather signal. Use a smaller --bdd-replay-images (e.g. ~2000-2500).\n")
 
     train_class_counter = Counter(class_counter)  # boxes so far are all train
 
