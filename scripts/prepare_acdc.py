@@ -132,13 +132,32 @@ def find_gt_root(raw_dir: Path) -> Path | None:
     return None
 
 
-def build_json_lookup(gt_split_dir: Path):
-    """If COCO panoptic JSON(s) exist under the split dir, index segments by image stem."""
+_JSON_CACHE: dict = {}
+
+
+def build_json_lookup(gt_root: Path, split: str):
+    """Index COCO panoptic segments by image stem for a whole split.
+
+    ACDC ships one JSON per split at the gt root (e.g. gt_panoptic/train_gt_panoptic.json)
+    covering all weather conditions. Older layouts keep a JSON per condition/split dir —
+    both are supported. Result is cached per (gt_root, split).
+    """
+    cache_key = (str(gt_root), split)
+    if cache_key in _JSON_CACHE:
+        return _JSON_CACHE[cache_key]
+
     lookup: dict[str, list] = {}
     cats: dict[int, str | None] = dict(CITYSCAPES_ID_TO_NAME)
-    if not gt_split_dir.exists():
-        return lookup, cats
-    for jp in gt_split_dir.rglob("*.json"):
+
+    # Root-level split JSON (standard ACDC), then per-condition/split dirs (fallback).
+    jsons = list(gt_root.glob(f"*{split}*panoptic*.json")) + list(gt_root.glob(f"{split}_*.json"))
+    if not jsons:
+        for cond in WEATHER_CONDITIONS:
+            sub = gt_root / cond / split
+            if sub.exists():
+                jsons += list(sub.rglob("*.json"))
+
+    for jp in dict.fromkeys(jsons):  # dedup, keep order
         try:
             data = json.loads(jp.read_text(encoding="utf-8"))
         except Exception:
@@ -152,6 +171,8 @@ def build_json_lookup(gt_split_dir: Path):
             key = Path(ann.get("file_name", "")).stem.replace("_rgb_anon", "").replace("_gt_panoptic", "")
             if key:
                 lookup[key] = ann.get("segments_info", [])
+
+    _JSON_CACHE[cache_key] = (lookup, cats)
     return lookup, cats
 
 
@@ -167,7 +188,7 @@ def load_split(raw_dir: Path, gt_root: Path, condition: str, split: str) -> list
         print(f"  [SKIP] no RGB dir: {img_root}")
         return []
 
-    json_lookup, cat_lookup = build_json_lookup(gt_split)
+    json_lookup, cat_lookup = build_json_lookup(gt_root, split)
     samples: list[PreparedSample] = []
     skipped = Counter()
 
