@@ -40,6 +40,10 @@ from pathlib import Path
 TARGET_CLASSES = ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+# Rare-class oversampling: a train image is duplicated by the LARGEST multiplier among
+# the rare classes it contains. Images that only contain car/person/truck are untouched.
+RARE_MULTIPLIERS = {"bicycle": 2, "motorcycle": 3, "bus": 3}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -91,6 +95,61 @@ def place(src: Path, dst: Path, mode: str) -> None:
         shutil.copy2(src, dst)
     else:
         os.symlink(src.resolve(), dst)
+
+
+def classes_in_label(label_path: Path) -> set[str]:
+    """Return the set of target-class names present in a YOLO label file."""
+    present: set[str] = set()
+    try:
+        for line in label_path.read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            cid = int(float(parts[0]))
+            if 0 <= cid < len(TARGET_CLASSES):
+                present.add(TARGET_CLASSES[cid])
+    except OSError:
+        pass
+    return present
+
+
+def oversample_rare(out_img_dir: Path, out_lbl_dir: Path, mode: str,
+                    manifest_rows: list[dict]) -> tuple[int, Counter, dict]:
+    """Duplicate already-written TRAIN images that contain rare classes.
+
+    Multiplier per image = max RARE_MULTIPLIERS over the rare classes it contains
+    (1 if none). Creates (mult-1) extra copies suffixed _osK.
+    Returns (duplicate_images, duplicate_boxes_per_class, multiplier_distribution).
+    """
+    dup_images = 0
+    dup_boxes: Counter = Counter()
+    mult_dist: Counter = Counter()
+    for lbl in sorted(out_lbl_dir.glob("*.txt")):
+        present = classes_in_label(lbl)
+        mult = max((RARE_MULTIPLIERS[c] for c in present if c in RARE_MULTIPLIERS), default=1)
+        mult_dist[mult] += 1
+        if mult <= 1:
+            continue
+        imgs = list(out_img_dir.glob(f"{lbl.stem}.*"))
+        if not imgs:
+            continue
+        img = imgs[0]
+        box_counter: Counter = Counter()
+        count_boxes(lbl, box_counter)
+        for k in range(1, mult):
+            dup_img = out_img_dir / f"{lbl.stem}_os{k}{img.suffix.lower()}"
+            dup_lbl = out_lbl_dir / f"{lbl.stem}_os{k}.txt"
+            place(img, dup_img, mode)
+            place(lbl, dup_lbl, mode)
+            dup_images += 1
+            for c, n in box_counter.items():
+                dup_boxes[c] += n
+            manifest_rows.append({
+                "source_dataset": "oversample", "split": "train",
+                "image_path": str(img), "label_path": str(lbl),
+                "new_image": str(dup_img), "new_label": str(dup_lbl),
+            })
+    return dup_images, dup_boxes, dict(sorted(mult_dist.items()))
 
 
 def write_split(
@@ -145,6 +204,9 @@ def parse_args() -> argparse.Namespace:
                          "Recommended ~2000-2500 so BDD stays a minority.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--mode", choices=["symlink", "copy"], default="symlink")
+    ap.add_argument("--oversample-rare", action="store_true",
+                    help="Duplicate train images containing rare classes "
+                         "(bicycle x2, motorcycle x3, bus x3). Does not touch val/test.")
     ap.add_argument("--clean", action="store_true", help="Remove --out-root if it exists")
     return ap.parse_args()
 
@@ -209,7 +271,22 @@ def main() -> None:
               f"images ({adverse}). Clear-weather BDD dominates the merge and will dilute the "
               f"adverse-weather signal. Use a smaller --bdd-replay-images (e.g. ~2000-2500).\n")
 
-    train_class_counter = Counter(class_counter)  # boxes so far are all train
+    train_class_counter = Counter(class_counter)  # base train boxes (before oversampling)
+    base_train_total = total_images = (images_per_source["xwod_train"]
+                                       + images_per_source["acdc_train"]
+                                       + images_per_source["bdd_replay"])
+
+    # ── Rare-class oversampling (train only) ──
+    dup_images = 0
+    dup_boxes: Counter = Counter()
+    mult_dist: dict = {}
+    if args.oversample_rare:
+        dup_images, dup_boxes, mult_dist = oversample_rare(
+            out_train_img, out_train_lbl, args.mode, manifest_rows)
+        print(f"Oversampling rare classes {RARE_MULTIPLIERS}: +{dup_images} duplicate images.")
+
+    after_class_counter = train_class_counter + dup_boxes
+    after_train_total = base_train_total + dup_images
 
     # ── Validation = XWOD val ──
     val_counter: Counter = Counter()
@@ -238,16 +315,23 @@ def main() -> None:
         writer.writerows(manifest_rows)
 
     # ── stats.json ──
-    total_train = (images_per_source["xwod_train"] + images_per_source["acdc_train"]
-                   + images_per_source["bdd_replay"])
     stats = {
         "seed": args.seed,
         "mode": args.mode,
         "bdd_replay_ratio": args.bdd_replay_ratio,
         "images_per_source": images_per_source,
-        "train_total": total_train,
+        "oversample_rare": {
+            "enabled": args.oversample_rare,
+            "multipliers": RARE_MULTIPLIERS if args.oversample_rare else {},
+            "base_train_images": base_train_total,
+            "duplicate_images": dup_images,
+            "train_images_after": after_train_total,
+            "multiplier_distribution": mult_dist,
+        },
+        "train_total": after_train_total,
         "val_total": images_per_source["xwod_val"],
-        "train_boxes_per_class": {c: train_class_counter.get(c, 0) for c in TARGET_CLASSES},
+        "train_boxes_per_class_before": {c: train_class_counter.get(c, 0) for c in TARGET_CLASSES},
+        "train_boxes_per_class_after": {c: after_class_counter.get(c, 0) for c in TARGET_CLASSES},
         "val_boxes_per_class": {c: val_counter.get(c, 0) for c in TARGET_CLASSES},
     }
     (out / "stats.json").write_text(json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -260,16 +344,19 @@ def main() -> None:
     print("-" * 34)
     print(f"{'XWOD':<16}{'train':<8}{images_per_source['xwod_train']:>10}")
     print(f"{'ACDC':<16}{'train':<8}{images_per_source['acdc_train']:>10}")
-    print(f"{'BDD replay':<16}{'train':<8}{images_per_source['bdd_replay']:>10}"
-          f"   ({args.bdd_replay_ratio:.0%} of {len(bdd_all)})")
+    print(f"{'BDD replay':<16}{'train':<8}{images_per_source['bdd_replay']:>10}")
     print("-" * 34)
-    print(f"{'TRAIN TOTAL':<16}{'':<8}{total_train:>10}")
+    print(f"{'BASE TRAIN':<16}{'':<8}{base_train_total:>10}")
+    if args.oversample_rare:
+        print(f"{'+ duplicates':<16}{'':<8}{dup_images:>10}   dist={mult_dist}")
+        print(f"{'TRAIN AFTER':<16}{'':<8}{after_train_total:>10}")
     print(f"{'XWOD':<16}{'val':<8}{images_per_source['xwod_val']:>10}")
 
-    print(f"\n{'Class':<14}{'Train boxes':>12}{'Val boxes':>12}")
-    print("-" * 38)
+    print(f"\n{'Class':<14}{'Boxes before':>14}{'Boxes after':>14}{'Val boxes':>12}")
+    print("-" * 54)
     for c in TARGET_CLASSES:
-        print(f"{c:<14}{train_class_counter.get(c, 0):>12}{val_counter.get(c, 0):>12}")
+        print(f"{c:<14}{train_class_counter.get(c, 0):>14}{after_class_counter.get(c, 0):>14}"
+              f"{val_counter.get(c, 0):>12}")
 
     print(f"\ndataset.yaml + manifest.csv + stats.json → {out}")
 
