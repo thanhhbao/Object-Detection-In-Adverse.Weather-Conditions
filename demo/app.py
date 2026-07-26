@@ -22,6 +22,7 @@ from streamlit_paste_button import paste_image_button
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.inference import (
     load_model,
+    list_local_models,
     detect_image_boxes,
     process_video_to_file,
     download_video_from_url,
@@ -38,7 +39,22 @@ css = (Path(__file__).parent / "assets" / "style.css").read_text()
 st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
 CLASS_LABELS = [c.capitalize() for c in CLASSES]
-model = load_model()
+
+# Multiple checkpoints can live in demo/runs — pick one from the toolbar to test.
+MODELS = list_local_models()
+if MODELS:
+    _default = next((n for n in MODELS if "v3_960" in n or "phase2_v3" in n), list(MODELS)[0])
+    st.session_state.setdefault("model_choice", _default)
+    if st.session_state["model_choice"] not in MODELS:
+        st.session_state["model_choice"] = _default
+    model = load_model(MODELS[st.session_state["model_choice"]])
+    # Switching model clears stale detection results
+    if st.session_state.get("_last_model") != st.session_state["model_choice"]:
+        st.session_state.pop("img_result", None)
+        st.session_state.pop("vid_result", None)
+        st.session_state["_last_model"] = st.session_state["model_choice"]
+else:
+    model = load_model()
 
 # ── Session init ──────────────────────────────────────────────────────────────
 st.session_state.setdefault("recents", [])       # list of {name, kind, bytes, meta}
@@ -98,7 +114,10 @@ with st.container(border=True):
     with tb_actions:
         a1, a2 = st.columns([3, 2], vertical_alignment="center")
         with a1:
-            st.selectbox("Model", ["Best model · fast"], label_visibility="collapsed")
+            if MODELS:
+                st.selectbox("Model", list(MODELS), key="model_choice", label_visibility="collapsed")
+            else:
+                st.selectbox("Model", ["auto (best.pt)"], label_visibility="collapsed", disabled=True)
         with a2:
             run = st.button("Run detection", key="run_btn")
 

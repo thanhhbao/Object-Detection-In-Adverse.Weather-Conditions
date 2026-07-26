@@ -37,6 +37,20 @@ def _find_local_weights() -> Path | None:
     return None
 
 
+def list_local_models() -> dict[str, str]:
+    """Return {display_name: path} for every .pt found in demo/runs and demo/weights.
+
+    Lets the demo offer several checkpoints (e.g. v3_960, v8s, v5) to switch between
+    for testing, without replacing a single best.pt.
+    """
+    found: dict[str, str] = {}
+    for folder in (_DEMO_ROOT / "runs", _DEMO_ROOT / "weights"):
+        if folder.exists():
+            for p in sorted(folder.rglob("*.pt")):
+                found[p.stem] = str(p)
+    return found
+
+
 def _download_weights() -> Path:
     """Download model weights from Google Drive if not cached."""
     cache_dir = Path(tempfile.gettempdir()) / "od_demo_weights"
@@ -58,18 +72,23 @@ def _download_weights() -> Path:
 
 
 @st.cache_resource(show_spinner=False)
-def load_model():
-    """Load YOLO model once and cache across sessions."""
+def load_model(weights_path: str | None = None):
+    """Load a YOLO model, cached per path so multiple checkpoints can coexist.
+
+    If weights_path is given, load it. Otherwise: env var → local weights → Google Drive.
+    """
     from ultralytics import YOLO
 
-    # Priority: env var → local weights → Google Drive
-    local = _find_local_weights()
-    if os.environ.get(MODEL_PATH_ENV):
-        path = Path(os.environ[MODEL_PATH_ENV])
-    elif local is not None:
-        path = local
+    if weights_path:
+        path = Path(weights_path)
     else:
-        path = _download_weights()
+        local = _find_local_weights()
+        if os.environ.get(MODEL_PATH_ENV):
+            path = Path(os.environ[MODEL_PATH_ENV])
+        elif local is not None:
+            path = local
+        else:
+            path = _download_weights()
 
     with st.spinner("Loading model..."):
         model = YOLO(str(path))
