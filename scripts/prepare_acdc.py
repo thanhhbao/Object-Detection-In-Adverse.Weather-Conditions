@@ -242,6 +242,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--conditions", type=str, default="all", help="fog,rain,snow,night or 'all'")
     p.add_argument("--splits", type=str, default="train,val", help="ACDC splits to use (default train,val)")
     p.add_argument("--clean", action="store_true")
+    p.add_argument("--resplit", action="store_true",
+                   help="Gộp train+val rồi chia lại theo --train-ratio/--val-ratio (6-1-3)")
+    p.add_argument("--train-ratio", type=float, default=0.6)
+    p.add_argument("--val-ratio", type=float, default=0.1)
     return p.parse_args()
 
 
@@ -269,7 +273,7 @@ def main() -> None:
             found = load_split(raw_dir, gt_root, condition, split)
             print(f"  → {len(found)} images with boxes")
             for s in found:
-                assignments[len(all_samples)] = split   # preserve ACDC split
+                assignments[len(all_samples)] = split   # preserve ACDC split (overridden if --resplit)
                 all_samples.append(s)
 
     if not all_samples:
@@ -277,6 +281,37 @@ def main() -> None:
             "No labelled images found. Check --raw-dir and that GT masks/JSON exist.\n"
             "Run the diagnostic in docs/PHASE2_DATASET.md / ask if box decoding failed."
         )
+
+    if args.resplit:
+        # Gộp tất cả, chia lại stratified by condition
+        import random as _random
+        rng = _random.Random(args.seed)
+
+        by_condition: dict[str, list[int]] = {}
+        for i, s in enumerate(all_samples):
+            cond = getattr(s, "condition", "unknown")
+            by_condition.setdefault(cond, []).append(i)
+
+        # Fallback: nếu PreparedSample không có field condition, chia đều toàn bộ
+        if all(k == "unknown" for k in by_condition):
+            indices = list(range(len(all_samples)))
+            rng.shuffle(indices)
+            n_train = int(len(indices) * args.train_ratio)
+            n_val   = int(len(indices) * args.val_ratio)
+            for j, idx in enumerate(indices):
+                assignments[idx] = "train" if j < n_train else "val" if j < n_train + n_val else "test"
+        else:
+            for cond, indices in sorted(by_condition.items()):
+                rng.shuffle(indices)
+                n = len(indices)
+                n_train = int(n * args.train_ratio)
+                n_val   = int(n * args.val_ratio)
+                for j, idx in enumerate(indices):
+                    assignments[idx] = "train" if j < n_train else "val" if j < n_train + n_val else "test"
+                print(f"  {cond}: total={n}, train={n_train}, val={n_val}, test={n-n_train-n_val}")
+        out_splits = ("train", "val", "test")
+    else:
+        out_splits = tuple(splits)
 
     # Sanity report: boxes per class + images per split
     class_counter: Counter = Counter()
@@ -296,7 +331,7 @@ def main() -> None:
         raw_root=raw_dir,
         output_dir=output_dir,
         imgsz=args.imgsz,
-        splits=tuple(splits),
+        splits=out_splits,
     )
 
 

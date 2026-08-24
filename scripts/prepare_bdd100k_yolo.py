@@ -22,6 +22,12 @@ Usage (full train set):
     --src /workspace/datasets/bdd100k_yolo_raw \
     --dst /workspace/datasets/bdd100k_6cls_full_yolo \
     --full
+
+Usage with val→test+val split (7-3):
+  python3 scripts/prepare_bdd100k_yolo.py \
+    --src /workspace/datasets/bdd100k_yolo_raw \
+    --dst /workspace/datasets/bdd100k_6cls_30k_yolo \
+    --subset-size 30000 --seed 42 --split-val --test-ratio 0.7
 """
 
 from __future__ import annotations
@@ -190,6 +196,10 @@ def parse_args() -> argparse.Namespace:
                     help="Copy images instead of symlink (uses more disk)")
     ap.add_argument("--clean", action="store_true",
                     help="Remove --dst if it already exists")
+    ap.add_argument("--split-val", action="store_true",
+                    help="Split the 10k val into val + test (use --test-ratio to control)")
+    ap.add_argument("--test-ratio", type=float, default=0.7,
+                    help="Fraction of val images to assign to test split (default 0.7)")
     return ap.parse_args()
 
 
@@ -235,17 +245,31 @@ def main() -> None:
         train_names = pool[:args.subset_size]
         print(f"Random subset: {len(train_names)} images\n")
 
-    val_names = [p.name for p in sorted(src_val_img.glob("*.jpg"))]
+    all_val_names = [p.name for p in sorted(src_val_img.glob("*.jpg"))]
+
+    if args.split_val:
+        rng = random.Random(args.seed)
+        shuffled = list(all_val_names)
+        rng.shuffle(shuffled)
+        n_test = int(len(shuffled) * args.test_ratio)
+        test_names = shuffled[:n_test]
+        val_names  = shuffled[n_test:]
+        print(f"\nSplit val {len(all_val_names)} → val {len(val_names)} / test {len(test_names)}")
+    else:
+        val_names  = all_val_names
+        test_names = []
 
     print("Processing splits...")
     process_split(train_names, src_train_img, src_train_lbl, dst, "train", args.copy_images)
     process_split(val_names,   src_val_img,   src_val_lbl,   dst, "val",   args.copy_images)
+    if test_names:
+        process_split(test_names, src_val_img, src_val_lbl, dst, "test", args.copy_images)
 
-    (dst / "dataset.yaml").write_text(
-        f"path: {dst}\ntrain: images/train\nval: images/val\nnc: 6\nnames:\n"
-        + "".join(f"  {i}: {n}\n" for i, n in enumerate(CLASSES)),
-        encoding="utf-8",
-    )
+    yaml_lines = f"path: {dst}\ntrain: images/train\nval: images/val\n"
+    if test_names:
+        yaml_lines += "test: images/test\n"
+    yaml_lines += "nc: 6\nnames:\n" + "".join(f"  {i}: {n}\n" for i, n in enumerate(CLASSES))
+    (dst / "dataset.yaml").write_text(yaml_lines, encoding="utf-8")
     print(f"\nDone: {dst}")
 
 

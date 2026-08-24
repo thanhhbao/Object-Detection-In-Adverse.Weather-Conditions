@@ -46,6 +46,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the run name (config name), e.g. a per-seed run folder.",
     )
+    parser.add_argument(
+        "--data",
+        default=None,
+        help="Override dataset YAML for evaluation (e.g. DAWN, ACDC held-out sets). "
+             "If omitted, uses config['data']. Does NOT override the training dataset.",
+    )
+    parser.add_argument(
+        "--metrics-tag",
+        dest="metrics_tag",
+        default=None,
+        help="Output filename prefix: {metrics_tag}_metrics.json. "
+             "Defaults to --split value. Use a descriptive tag when evaluating "
+             "multiple datasets (e.g. 'xwod_test', 'dawn_val', 'acdc_val') so "
+             "files don't overwrite each other.",
+    )
     return parser.parse_args()
 
 
@@ -134,8 +149,9 @@ def main() -> None:
         raise FileNotFoundError(f"Missing checkpoint: {checkpoint}")
 
     model = YOLO(str(checkpoint))
-    data_yaml = resolve_from_root(config["data"])
-    eval_name = args.name or f"{args.split}_eval"
+    data_yaml = Path(args.data) if args.data else resolve_from_root(config["data"])
+    metrics_tag = args.metrics_tag or args.split
+    eval_name = args.name or f"{metrics_tag}_eval"
 
     metrics = model.val(
         data=str(data_yaml),
@@ -173,7 +189,7 @@ def main() -> None:
         "per_class": per_class,
     }
 
-    output = experiment_run_dir(config) / f"{args.split}_metrics.json"
+    output = experiment_run_dir(config) / f"{metrics_tag}_metrics.json"
     write_json(output, result)
     print(result)
     print(f"Saved: {output}")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert DAWN Pascal VOC annotations to a stratified YOLO dataset.
+"""Convert DAWN Pascal VOC annotations to a stratified YOLO dataset (val+test only).
 
 Mục đích của file này:
 1. Đọc tập DAWN thô, gồm ảnh và file nhãn Pascal VOC XML.
@@ -8,9 +8,9 @@ Mục đích của file này:
 4. Resize ảnh theo kiểu letterbox để giữ tỉ lệ ảnh gốc.
 5. Chuyển bbox từ Pascal VOC `xmin ymin xmax ymax` sang YOLO
    `class_id x_center y_center width height`, tất cả đã được chuẩn hóa về [0, 1].
-6. Chia dữ liệu thành train/val/test theo tỉ lệ 70/15/15, có phân tầng theo thời
-   tiết để mỗi split có phân phối thời tiết gần nhau hơn.
-7. Tạo cấu trúc thư mục và file `dataset.yaml` để Ultralytics YOLO có thể train.
+6. Chia dữ liệu thành val/test theo tỉ lệ 3/7 (không có train — DAWN chỉ dùng để
+   đánh giá out-of-domain), có phân tầng theo thời tiết.
+7. Tạo cấu trúc thư mục và file `dataset.yaml` để Ultralytics YOLO có thể eval.
 """
 
 # Cho phép dùng cú pháp type hint mới như `list[Sample]` ổn định hơn giữa các
@@ -110,6 +110,10 @@ def parse_args() -> argparse.Namespace:
 
     # Nếu bật --clean, xóa output cũ trước khi tạo lại để tránh lẫn split cũ.
     parser.add_argument("--clean", action="store_true", help="Delete output first.")
+
+    # Tỉ lệ val trong tổng (phần còn lại → test). Mặc định 0.3 (val 30%, test 70%).
+    parser.add_argument("--val-ratio", type=float, default=0.3,
+                        help="Fraction of images for val split (default 0.3, rest→test)")
     return parser.parse_args()
 
 
@@ -150,36 +154,26 @@ def find_samples(raw_dir: Path) -> list[Sample]:
     return samples
 
 
-def stratified_split(samples: list[Sample], seed: int) -> dict[Path, str]:
-    """Split each weather group independently to approximate 70/15/15."""
+def stratified_split(samples: list[Sample], seed: int, val_ratio: float = 0.3) -> dict[Path, str]:
+    """Split each weather group into val/test only (no train). Default val 30%, test 70%."""
 
-    # Dùng object Random riêng để việc shuffle không ảnh hưởng random global.
     rng = random.Random(seed)
 
-    # Gom mẫu theo weather. Mục tiêu: fog/rain/snow/sand đều có mặt tương đối đều
-    # trong train, val và test.
     groups: dict[str, list[Sample]] = defaultdict(list)
     for sample in samples:
         groups[sample.weather].append(sample)
 
-    # assignment ánh xạ từ đường dẫn ảnh gốc sang split: train, val hoặc test.
     assignment: dict[Path, str] = {}
     for weather, group in sorted(groups.items()):
-        # Shuffle từng nhóm weather bằng seed cố định.
         rng.shuffle(group)
-
-        # Tính số lượng ảnh cho train và val. Phần còn lại tự động là test.
         n = len(group)
-        n_train = int(n * 0.70)
-        n_val = int(n * 0.15)
+        n_val = int(n * val_ratio)
 
-        # Gán split theo thứ tự sau khi shuffle.
         for index, sample in enumerate(group):
-            split = "train" if index < n_train else "val" if index < n_train + n_val else "test"
+            split = "val" if index < n_val else "test"
             assignment[sample.image] = split
 
-        # In thống kê để người dùng biết split mỗi weather có bao nhiêu ảnh.
-        print(f"{weather}: total={n}, train={n_train}, val={n_val}, test={n-n_train-n_val}")
+        print(f"{weather}: total={n}, val={n_val}, test={n-n_val}")
     return assignment
 
 
@@ -313,15 +307,14 @@ def main() -> None:
             "to prevent stale files and train/val/test leakage."
         )
 
-    # Tạo sáu thư mục chuẩn YOLO: images/train, images/val, images/test,
-    # labels/train, labels/val, labels/test.
-    for split in ("train", "val", "test"):
+    # Tạo thư mục val và test (không có train — DAWN chỉ dùng để eval out-of-domain).
+    for split in ("val", "test"):
         (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
         (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
 
-    # Tìm toàn bộ cặp ảnh/XML và chia split theo weather.
+    # Tìm toàn bộ cặp ảnh/XML và chia val/test theo weather.
     samples = find_samples(raw_dir)
-    assignments = stratified_split(samples, args.seed)
+    assignments = stratified_split(samples, args.seed, val_ratio=args.val_ratio)
 
     # unknown_classes gom các class bị bỏ qua để người dùng biết annotation có gì.
     unknown_classes: Counter = Counter()
@@ -378,7 +371,6 @@ def main() -> None:
     # và tên lớp tương ứng với class_id.
     dataset_yaml = {
         "path": str(output_dir),
-        "train": "images/train",
         "val": "images/val",
         "test": "images/test",
         "names": {index: name for index, name in enumerate(CLASSES)},
