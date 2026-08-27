@@ -1,5 +1,5 @@
 """Phase 2 RT-DETR config must resolve to the merged dataset, not XWOD, and
-must keep the low-LR / small-batch continued fine-tune settings."""
+must keep the low-LR / batch-16 continued fine-tune settings."""
 
 from dawn_ablation.common import load_experiment_config
 
@@ -9,7 +9,7 @@ def test_phase2_config_resolves_merged_dataset_and_hparams():
 
     assert config["dataset"] == "phase2_merged"
     assert config["from_run"] == "stage2_xwod_rtdetr_from_bdd30k"
-    assert config["batch"] == 4
+    assert config["batch"] == 16
     assert config["lr0"] == 0.00005
     assert config["patience"] == 20
 

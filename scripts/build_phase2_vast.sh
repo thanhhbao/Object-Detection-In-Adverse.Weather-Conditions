@@ -13,7 +13,7 @@ python scripts/build_phase2_dataset.py \
   --acdc-root /workspace/datasets_noleak/acdc_6cls_yolo \
   --bdd-root /workspace/datasets_noleak/bdd100k_6cls_yolo \
   --out-root /workspace/datasets_noleak/phase2_merged_yolo \
-  --bdd-replay-images 2000 \
+  --bdd-use-all \
   --seed 42 \
   --mode symlink \
   --oversample-rare \
