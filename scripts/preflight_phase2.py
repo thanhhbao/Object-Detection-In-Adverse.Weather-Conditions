@@ -5,7 +5,9 @@ Enforces the OFFICIAL Phase 2 protocol before any GPU time is spent:
   - single model: RT-DETR-L, continued from stage2_xwod_rtdetr_from_bdd30k/weights/best.pt
   - dataset: phase2_merged = XWOD train (6006) + ACDC train (1182) + FULL BDD train (30000)
     => base_train_images = 37188, before rare-class oversampling
-  - batch = 16, lr0 = 0.00005, seed = 42
+  - batch = 16, lr0 = 0.00005, seed = 42 (training config) AND stats.json seed = 42,
+    bdd_mode = "full" (dataset-build provenance — a legacy replay-mode build must
+    never pass, even if it happens to contain 30000 BDD samples)
   - validation = XWOD val (1001) only
   - rare-class oversampling (bicycle x2, motorcycle x3, bus x3) enabled, train-only
   - no XWOD test / ACDC val / ACDC test / BDD val / BDD test / DAWN data anywhere in
@@ -261,6 +263,12 @@ def main() -> None:
         stats = json.loads(stats_path.read_text(encoding="utf-8"))
 
     if stats is not None:
+        # Dataset-build provenance: must have been built with --bdd-use-all (official
+        # mode), and with the official seed. A legacy replay-mode dataset must never
+        # pass, even if it happens to contain 30000 BDD samples by coincidence.
+        check.equal("stats.json bdd_mode", stats.get("bdd_mode"), "full")
+        check.equal("stats.json seed", stats.get("seed"), EXPECTED_SEED)
+
         images_per_source = stats.get("images_per_source", {})
         for key, expected in EXPECTED_SOURCE_COUNTS.items():
             check.equal(f"stats.json images_per_source.{key}", images_per_source.get(key), expected)

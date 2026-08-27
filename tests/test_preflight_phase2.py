@@ -87,6 +87,8 @@ def _write_stats(
     val_total: int = VAL_COUNT,
     oversample_enabled: bool = True,
     multipliers: dict | None = MULTIPLIERS,
+    bdd_mode: str = "full",
+    seed: int = 42,
 ) -> None:
     source_counts = source_counts if source_counts is not None else SOURCE_COUNTS
     if base_train_images is None:
@@ -95,7 +97,7 @@ def _write_stats(
         train_total = base_train_images + duplicate_images
 
     stats = {
-        "seed": 42, "mode": "symlink", "bdd_mode": "full",
+        "seed": seed, "mode": "symlink", "bdd_mode": bdd_mode,
         "bdd_replay_ratio": None, "bdd_replay_images_requested": None,
         "bdd_replay_images_actual": None,
         "images_per_source": source_counts,
@@ -320,6 +322,22 @@ def test_preflight_fails_on_wrong_base_train_images(tmp_path, monkeypatch, capsy
     config_yaml, _ = _build_env(tmp_path, stats_kwargs={"base_train_images": 999, "train_total": 999})
     assert _run(config_yaml, monkeypatch) == 1
     assert "base_train_images = 999" in capsys.readouterr().out
+
+
+def test_preflight_fails_on_legacy_replay_bdd_mode(tmp_path, monkeypatch, capsys):
+    # A legacy replay-mode dataset must never pass the official Phase 2 preflight,
+    # even if images_per_source coincidentally matches the expected counts.
+    config_yaml, _ = _build_env(tmp_path, stats_kwargs={"bdd_mode": "replay"})
+    assert _run(config_yaml, monkeypatch) == 1
+    assert "stats.json bdd_mode = replay, expected full" in capsys.readouterr().out
+
+
+def test_preflight_fails_on_wrong_stats_seed(tmp_path, monkeypatch, capsys):
+    # Dataset-build provenance (stats.json seed) is a separate invariant from the
+    # training config's seed — both must be 42, independently.
+    config_yaml, _ = _build_env(tmp_path, stats_kwargs={"seed": 0})
+    assert _run(config_yaml, monkeypatch) == 1
+    assert "stats.json seed = 0, expected 42" in capsys.readouterr().out
 
 
 def test_preflight_fails_on_oversampling_disabled(tmp_path, monkeypatch, capsys):
