@@ -319,6 +319,8 @@ def main() -> None:
         "seed": args.seed,
         "mode": args.mode,
         "bdd_replay_ratio": args.bdd_replay_ratio,
+        "bdd_replay_images_requested": args.bdd_replay_images,
+        "bdd_replay_images_actual": images_per_source["bdd_replay"],
         "images_per_source": images_per_source,
         "oversample_rare": {
             "enabled": args.oversample_rare,
