@@ -2,8 +2,9 @@ defaults: configs/common/train_defaults.yaml
 paths: configs/common/paths_colab.yaml
 
 from_run: stage2_xwod_rtdetr_from_bdd30k
-dataset: xwod
+dataset: phase2_merged
 name: phase2_final_rtdetr
 
+batch: 16
 lr0: 0.00005
 patience: 20

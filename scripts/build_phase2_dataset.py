@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """Build the Phase 2 merged training dataset for the final best model.
 
-Merges TRAIN data from:
-  1. XWOD train            (all)
-  2. ACDC train            (all, optional — only if --acdc-root exists)
-  3. BDD30K train replay   (a fraction, default 30%, to fight catastrophic forgetting)
+OFFICIAL Phase 2 protocol merges TRAIN data from all three sources in full:
+  1. XWOD train    (all)
+  2. ACDC train    (all, optional — only if --acdc-root exists)
+  3. BDD30K train   (ALL images — use --bdd-use-all)
+
+This is a joint three-dataset fine-tune, not a "BDD replay" experiment: the full
+BDD30K train split is intentionally included alongside XWOD/ACDC to retain the
+clear-weather driving domain during final multi-domain fine-tuning.
+
+A legacy BDD *replay* mode (--bdd-replay-images / --bdd-replay-ratio) is kept for
+backward compatibility with earlier ablations, but it is NOT the official Phase 2
+mode — use --bdd-use-all for the official build.
 
 Validation = XWOD val (the main val set). Test is intentionally left out of the merged
-dataset to avoid leakage — final evaluation is done separately on XWOD test, DAWN val,
-and ACDC val/test. In dataset.yaml, `test` points at `images/val` so Ultralytics has a
+dataset to avoid leakage — final evaluation is done separately on XWOD test, ACDC test,
+DAWN test, and BDD test. In dataset.yaml, `test` points at `images/val` so Ultralytics has a
 valid path, but real testing uses the held-out sets.
 
 All source datasets are already in the fixed 6-class project order, so labels are copied
@@ -17,13 +25,13 @@ as-is (no remapping):
 
 Filenames are prefixed (xwod_ / acdc_ / bdd_) to avoid collisions when merging.
 
-Example:
+Example (official Phase 2 — full BDD train):
   python scripts/build_phase2_dataset.py \\
-    --xwod-root /content/workspace/datasets/xwod_6cls_yolo \\
-    --bdd-root  /content/workspace/datasets/bdd100k_6cls_30k_yolo \\
-    --acdc-root /content/workspace/datasets/acdc_6cls_yolo \\
-    --out-root  /content/workspace/datasets/phase2_merged_yolo \\
-    --bdd-replay-ratio 0.3 --seed 42 --mode symlink --clean
+    --xwod-root /workspace/datasets_noleak/xwod_6cls_yolo \\
+    --acdc-root /workspace/datasets_noleak/acdc_6cls_yolo \\
+    --bdd-root  /workspace/datasets_noleak/bdd100k_6cls_yolo \\
+    --out-root  /workspace/datasets_noleak/phase2_merged_yolo \\
+    --bdd-use-all --seed 42 --mode symlink --oversample-rare --clean
 """
 
 from __future__ import annotations
@@ -191,17 +199,25 @@ def write_split(
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Build Phase 2 merged dataset (XWOD + ACDC + BDD replay)")
+    ap = argparse.ArgumentParser(description="Build Phase 2 merged dataset (XWOD + ACDC + full BDD train)")
     ap.add_argument("--xwod-root", type=Path, required=True)
     ap.add_argument("--bdd-root", type=Path, required=True)
     ap.add_argument("--acdc-root", type=Path, default=None, help="Optional — skipped if missing")
     ap.add_argument("--out-root", type=Path, required=True)
+    ap.add_argument("--retrieved-root", type=Path, default=None,
+                    help="Optional: BDD active-retrieved root (output of active_retrieval.py). "
+                         "When provided, adds retrieved images with bdd_retrieved source. "
+                         "When omitted, behaviour is 100%% identical to baseline.")
+    ap.add_argument("--bdd-use-all", action="store_true",
+                    help="OFFICIAL Phase 2 mode: include ALL valid BDD30K train image/label "
+                         "pairs, unshuffled and untruncated. Takes precedence over "
+                         "--bdd-replay-images/--bdd-replay-ratio.")
     ap.add_argument("--bdd-replay-ratio", type=float, default=0.3,
-                    help="Fraction of BDD30K train to replay (default 0.3). NOTE: 0.3*30000=9000 "
-                         "can dominate the merge — prefer --bdd-replay-images for a small minority.")
+                    help="LEGACY replay mode only (ignored if --bdd-use-all is set): fraction of "
+                         "BDD30K train to sample (default 0.3).")
     ap.add_argument("--bdd-replay-images", type=int, default=None,
-                    help="Absolute number of BDD replay images (overrides --bdd-replay-ratio). "
-                         "Recommended ~2000-2500 so BDD stays a minority.")
+                    help="LEGACY replay mode only (ignored if --bdd-use-all is set): absolute "
+                         "number of BDD images to sample, overrides --bdd-replay-ratio.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--mode", choices=["symlink", "copy"], default="symlink")
     ap.add_argument("--oversample-rare", action="store_true",
@@ -246,35 +262,59 @@ def main() -> None:
         )
     else:
         images_per_source["acdc_train"] = 0
-        print("ACDC not found — building XWOD + BDD replay only.")
+        print("ACDC not found — building XWOD + BDD only.")
 
-    # ── 3. BDD30K train replay (anti-forgetting minority) ──
-    # Replay is meant to be a SMALL minority so it doesn't drown the adverse-weather
-    # data. Prefer an absolute count (--bdd-replay-images); the ratio is a fraction of
-    # BDD30K and can easily overshoot (0.3 * 30000 = 9000, which dominates the merge).
+    # ── 3. BDD30K train ──
+    # OFFICIAL Phase 2 mode (--bdd-use-all): ALL valid BDD train pairs, unshuffled,
+    # untruncated — this is a joint three-dataset fine-tune, not a replay experiment.
+    # LEGACY mode (default when --bdd-use-all is not passed): sample a subset, kept only
+    # for backward compatibility with earlier replay-style ablations.
     bdd_all = list_pairs(args.bdd_root.resolve(), "train")
-    rng.shuffle(bdd_all)
-    if args.bdd_replay_images is not None:
-        n_replay = args.bdd_replay_images
+    if args.bdd_use_all:
+        bdd_mode = "full"
+        bdd_selected = bdd_all
     else:
-        n_replay = int(round(len(bdd_all) * args.bdd_replay_ratio))
-    n_replay = min(n_replay, len(bdd_all))
-    bdd_replay = bdd_all[:n_replay]
-    images_per_source["bdd_replay"] = write_split(
-        bdd_replay, "bdd_", "bdd", "train",
+        bdd_mode = "replay"
+        rng.shuffle(bdd_all)
+        if args.bdd_replay_images is not None:
+            n_replay = args.bdd_replay_images
+        else:
+            n_replay = int(round(len(bdd_all) * args.bdd_replay_ratio))
+        n_replay = min(n_replay, len(bdd_all))
+        bdd_selected = bdd_all[:n_replay]
+
+    images_per_source["bdd_train"] = write_split(
+        bdd_selected, "bdd_", "bdd", "train",
         out_train_img, out_train_lbl, args.mode, manifest_rows, class_counter,
     )
 
-    adverse = images_per_source["xwod_train"] + images_per_source["acdc_train"]
-    if images_per_source["bdd_replay"] > adverse:
-        print(f"\n  [WARN] BDD replay ({images_per_source['bdd_replay']}) exceeds adverse-weather "
-              f"images ({adverse}). Clear-weather BDD dominates the merge and will dilute the "
-              f"adverse-weather signal. Use a smaller --bdd-replay-images (e.g. ~2000-2500).\n")
+    if bdd_mode == "replay":
+        adverse = images_per_source["xwod_train"] + images_per_source["acdc_train"]
+        if images_per_source["bdd_train"] > adverse:
+            print(f"\n  [WARN] LEGACY replay mode: BDD replay ({images_per_source['bdd_train']}) "
+                  f"exceeds adverse-weather images ({adverse}). Clear-weather BDD dominates the "
+                  f"merge and will dilute the adverse-weather signal. Use a smaller "
+                  f"--bdd-replay-images (e.g. ~2000-2500), or use --bdd-use-all for the official "
+                  f"full three-dataset Phase 2 protocol.\n")
+
+    # ── 4. Retrieved BDD images (optional) ──
+    retrieved_class_counter: Counter = Counter()
+    if args.retrieved_root is not None and (args.retrieved_root / "images" / "train").exists():
+        retrieved_pairs = list_pairs(args.retrieved_root.resolve(), "train")
+        images_per_source["bdd_retrieved_train"] = write_split(
+            retrieved_pairs, "retrieved_bdd_", "bdd_retrieved", "train",
+            out_train_img, out_train_lbl, args.mode, manifest_rows, retrieved_class_counter,
+        )
+        class_counter.update(retrieved_class_counter)
+        print(f"Retrieved BDD: +{images_per_source['bdd_retrieved_train']} images added.")
+    else:
+        images_per_source["bdd_retrieved_train"] = 0
 
     train_class_counter = Counter(class_counter)  # base train boxes (before oversampling)
     base_train_total = total_images = (images_per_source["xwod_train"]
                                        + images_per_source["acdc_train"]
-                                       + images_per_source["bdd_replay"])
+                                       + images_per_source["bdd_train"]
+                                       + images_per_source["bdd_retrieved_train"])
 
     # ── Rare-class oversampling (train only) ──
     dup_images = 0
@@ -314,11 +354,20 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(manifest_rows)
 
+    # Base train total BEFORE retrieved (for stats only)
+    base_train_before_retrieval = (images_per_source["xwod_train"]
+                                   + images_per_source["acdc_train"]
+                                   + images_per_source["bdd_train"])
+
     # ── stats.json ──
     stats = {
         "seed": args.seed,
         "mode": args.mode,
-        "bdd_replay_ratio": args.bdd_replay_ratio,
+        "bdd_mode": bdd_mode,
+        # Legacy replay-mode fields — only meaningful when bdd_mode == "replay".
+        "bdd_replay_ratio": args.bdd_replay_ratio if bdd_mode == "replay" else None,
+        "bdd_replay_images_requested": args.bdd_replay_images if bdd_mode == "replay" else None,
+        "bdd_replay_images_actual": images_per_source["bdd_train"] if bdd_mode == "replay" else None,
         "images_per_source": images_per_source,
         "oversample_rare": {
             "enabled": args.oversample_rare,
@@ -333,6 +382,11 @@ def main() -> None:
         "train_boxes_per_class_before": {c: train_class_counter.get(c, 0) for c in TARGET_CLASSES},
         "train_boxes_per_class_after": {c: after_class_counter.get(c, 0) for c in TARGET_CLASSES},
         "val_boxes_per_class": {c: val_counter.get(c, 0) for c in TARGET_CLASSES},
+        # Retrieved BDD fields — zero/empty when --retrieved-root is not provided
+        "retrieved_train": images_per_source.get("bdd_retrieved_train", 0),
+        "base_train_total_before_retrieval": base_train_before_retrieval,
+        "train_total_with_retrieval_before_oversampling": base_train_total,
+        "retrieved_class_counts": {c: retrieved_class_counter.get(c, 0) for c in TARGET_CLASSES},
     }
     (out / "stats.json").write_text(json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -340,11 +394,12 @@ def main() -> None:
     print("\n" + "=" * 52)
     print("Phase 2 merged dataset built:", out)
     print("=" * 52)
+    bdd_label = "BDD (full)" if bdd_mode == "full" else "BDD replay"
     print(f"{'Source':<16}{'Split':<8}{'Images':>10}")
     print("-" * 34)
     print(f"{'XWOD':<16}{'train':<8}{images_per_source['xwod_train']:>10}")
     print(f"{'ACDC':<16}{'train':<8}{images_per_source['acdc_train']:>10}")
-    print(f"{'BDD replay':<16}{'train':<8}{images_per_source['bdd_replay']:>10}")
+    print(f"{bdd_label:<16}{'train':<8}{images_per_source['bdd_train']:>10}")
     print("-" * 34)
     print(f"{'BASE TRAIN':<16}{'':<8}{base_train_total:>10}")
     if args.oversample_rare:
