@@ -333,8 +333,11 @@ def test_d_provenance_max_sim_wins(tmp_path):
     h1 /= np.linalg.norm(h1)
     hard_embs = np.stack([h0, h1])
 
-    hardness_scores = {"hard0.jpg": 1.0, "hard1.jpg": 0.9}
-    img_to_dataset = {"hard0.jpg": "xwod", "hard1.jpg": "acdc"}
+    # Canonical keys match production code: str(path.resolve())
+    hard0_key = str(hard_paths[0].resolve())
+    hard1_key = str(hard_paths[1].resolve())
+    hardness_scores = {hard0_key: 1.0, hard1_key: 0.9}
+    img_to_dataset = {hard0_key: "xwod", hard1_key: "acdc"}
 
     selected, stats = retrieve_from_pool_with_provenance(
         hard_embs=hard_embs,
@@ -355,6 +358,7 @@ def test_d_provenance_max_sim_wins(tmp_path):
         f"Expected hard_paths[0] as query (higher sim), got {entry['query_path']}"
     )
     assert entry["query_dataset"] == "xwod"
+    assert entry["hardness_score"] == pytest.approx(1.0)
 
 
 # ── Test E: Dedup statistics ──────────────────────────────────────────────────
