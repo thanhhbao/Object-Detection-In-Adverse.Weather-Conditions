@@ -1,0 +1,12 @@
+defaults: configs/common/train_defaults.yaml
+paths: configs/common/paths_vast.yaml
+
+from_run: phase2_final_rtdetr
+dataset: phase2_merged
+name: p2_a0c_rtdetr_continue_control
+
+epochs: 20
+patience: 8
+lr0: 0.00001
+batch: 16
+seed: 42

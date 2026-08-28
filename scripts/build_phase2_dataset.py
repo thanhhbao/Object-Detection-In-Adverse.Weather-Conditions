@@ -204,6 +204,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--bdd-root", type=Path, required=True)
     ap.add_argument("--acdc-root", type=Path, default=None, help="Optional — skipped if missing")
     ap.add_argument("--out-root", type=Path, required=True)
+    ap.add_argument("--retrieved-root", type=Path, default=None,
+                    help="Optional: BDD active-retrieved root (output of active_retrieval.py). "
+                         "When provided, adds retrieved images with bdd_retrieved source. "
+                         "When omitted, behaviour is 100%% identical to baseline.")
     ap.add_argument("--bdd-use-all", action="store_true",
                     help="OFFICIAL Phase 2 mode: include ALL valid BDD30K train image/label "
                          "pairs, unshuffled and untruncated. Takes precedence over "
@@ -293,10 +297,24 @@ def main() -> None:
                   f"--bdd-replay-images (e.g. ~2000-2500), or use --bdd-use-all for the official "
                   f"full three-dataset Phase 2 protocol.\n")
 
+    # ── 4. Retrieved BDD images (optional) ──
+    retrieved_class_counter: Counter = Counter()
+    if args.retrieved_root is not None and (args.retrieved_root / "images" / "train").exists():
+        retrieved_pairs = list_pairs(args.retrieved_root.resolve(), "train")
+        images_per_source["bdd_retrieved_train"] = write_split(
+            retrieved_pairs, "retrieved_bdd_", "bdd_retrieved", "train",
+            out_train_img, out_train_lbl, args.mode, manifest_rows, retrieved_class_counter,
+        )
+        class_counter.update(retrieved_class_counter)
+        print(f"Retrieved BDD: +{images_per_source['bdd_retrieved_train']} images added.")
+    else:
+        images_per_source["bdd_retrieved_train"] = 0
+
     train_class_counter = Counter(class_counter)  # base train boxes (before oversampling)
     base_train_total = total_images = (images_per_source["xwod_train"]
                                        + images_per_source["acdc_train"]
-                                       + images_per_source["bdd_train"])
+                                       + images_per_source["bdd_train"]
+                                       + images_per_source["bdd_retrieved_train"])
 
     # ── Rare-class oversampling (train only) ──
     dup_images = 0
@@ -336,6 +354,11 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(manifest_rows)
 
+    # Base train total BEFORE retrieved (for stats only)
+    base_train_before_retrieval = (images_per_source["xwod_train"]
+                                   + images_per_source["acdc_train"]
+                                   + images_per_source["bdd_train"])
+
     # ── stats.json ──
     stats = {
         "seed": args.seed,
@@ -359,6 +382,11 @@ def main() -> None:
         "train_boxes_per_class_before": {c: train_class_counter.get(c, 0) for c in TARGET_CLASSES},
         "train_boxes_per_class_after": {c: after_class_counter.get(c, 0) for c in TARGET_CLASSES},
         "val_boxes_per_class": {c: val_counter.get(c, 0) for c in TARGET_CLASSES},
+        # Retrieved BDD fields — zero/empty when --retrieved-root is not provided
+        "retrieved_train": images_per_source.get("bdd_retrieved_train", 0),
+        "base_train_total_before_retrieval": base_train_before_retrieval,
+        "train_total_with_retrieval_before_oversampling": base_train_total,
+        "retrieved_class_counts": {c: retrieved_class_counter.get(c, 0) for c in TARGET_CLASSES},
     }
     (out / "stats.json").write_text(json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8")
 
