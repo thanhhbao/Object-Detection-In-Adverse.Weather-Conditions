@@ -79,8 +79,10 @@ def main() -> None:
         if has_rtdetr:
             print("  RTDETRDecoder detected — RT-DETR architecture confirmed.")
         else:
-            print("  WARNING: RTDETRDecoder NOT found. Model may not be RT-DETR.")
-            print(f"  Continuing — embedding extraction may still work for layers {embedding_layers}.")
+            print("SMOKE CHECK: FAIL — RTDETRDecoder NOT found in loaded checkpoint.")
+            print(f"  Expected RT-DETR model for P2-A1 embedding layers {embedding_layers}.")
+            print("  Ensure you passed the correct Phase2 RT-DETR best.pt checkpoint.")
+            sys.exit(1)
 
         # 3. Register MultiScaleHook
         print(f"\n[2/5] Registering MultiScaleHook on layers {embedding_layers}...")

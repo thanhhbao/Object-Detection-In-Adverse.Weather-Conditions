@@ -414,8 +414,8 @@ def find_hard_samples_gt_aware(
     """
     img_paths = sorted(p for p in image_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS)
     hard_imgs = []
-    hardness_scores: dict = {}
-    img_to_dataset: dict = {}
+    hardness_scores: dict = {}   # canonical_key -> hardness score
+    img_to_dataset: dict = {}    # canonical_key -> dataset name
     skipped_no_gt = 0
     skipped_easy = 0
 
@@ -472,9 +472,12 @@ def find_hard_samples_gt_aware(
                 max_hardness = max(max_hardness, hardness)
 
         if image_is_hard:
+            # Use canonical resolved path as key to avoid basename collisions
+            # across datasets (e.g. XWOD and ACDC may share filenames)
+            canonical_key = str(img_path.resolve())
             hard_imgs.append(img_path)
-            hardness_scores[img_path.name] = max_hardness
-            img_to_dataset[img_path.name] = query_dataset
+            hardness_scores[canonical_key] = max_hardness
+            img_to_dataset[canonical_key] = query_dataset
         else:
             skipped_easy += 1
 
@@ -571,6 +574,8 @@ def retrieve_from_pool_with_provenance(
     candidate_hits_above_threshold = 0
 
     for h_idx, hard_path in enumerate(hard_paths):
+        # Canonical key: resolved path string (avoids basename collision across datasets)
+        canonical_key = str(hard_path.resolve())
         sims = sim_matrix[h_idx]
         order = np.argsort(-sims)
         for p_idx in order:
@@ -585,8 +590,8 @@ def retrieve_from_pool_with_provenance(
                     "pool_path": p_path,
                     "sim": score,
                     "query_path": hard_path,
-                    "query_dataset": img_to_dataset.get(hard_path.name, ""),
-                    "hardness_score": hardness_scores.get(hard_path.name, 0.0),
+                    "query_dataset": img_to_dataset.get(canonical_key, ""),
+                    "hardness_score": hardness_scores.get(canonical_key, 0.0),
                 }
 
     unique_before_topk = len(best_per_stem)
@@ -635,11 +640,20 @@ def validate_query_root(qr: Path) -> Path:
 
 # ── Cache metadata helpers ─────────────────────────────────────────────────────
 
+def _pool_fingerprint(pool_paths: list) -> str:
+    """SHA-256 of sorted pool basenames — detects filename changes even when count is same."""
+    import hashlib
+    h = hashlib.sha256()
+    for p in sorted(pool_paths, key=lambda x: x.name):
+        h.update((p.name + "\n").encode())
+    return h.hexdigest()[:32]
+
+
 def _cache_fingerprint(
     weights_path: Path,
     layer_indices: list,
     imgsz: int,
-    pool_count: int,
+    pool_paths: list,
 ) -> dict:
     import hashlib
     weights_path = Path(weights_path)
@@ -656,8 +670,9 @@ def _cache_fingerprint(
         "checkpoint_sha256_prefix": sha,
         "embedding_layers": layer_indices,
         "imgsz": imgsz,
-        "pool_count": pool_count,
-        "version": 2,
+        "pool_count": len(pool_paths),
+        "pool_fingerprint": _pool_fingerprint(pool_paths),
+        "version": 3,
     }
 
 
@@ -815,6 +830,9 @@ def parse_args_new() -> argparse.Namespace:
     p.add_argument("--used-bdd-root", type=Path, default=None,
                    help="BDD30K root already in project — used for post-selection leakage check")
     p.add_argument("--mode", choices=["symlink", "copy"], default="symlink")
+    p.add_argument("--clean", action="store_true",
+                   help="Remove --out-root completely before writing. Without --clean, "
+                        "fails if output already contains images or labels from a previous run.")
     p.add_argument("--smoke-check", action="store_true",
                    help="Load model, run one forward on dummy image, print shapes, exit 0.")
     return p.parse_args()
@@ -875,6 +893,28 @@ def main_new(args: argparse.Namespace) -> None:
     rng = random.Random(args.seed)
     _ = rng  # seed used for future random operations
     out_root = args.out_root.resolve()
+
+    # Clean / stale-output guard
+    if hasattr(args, "clean") and args.clean:
+        if out_root.exists():
+            print(f"  --clean: removing existing output at {out_root}")
+            shutil.rmtree(out_root)
+    else:
+        # Without --clean, fail if stale images/labels exist
+        stale_img = out_root / "images" / "train"
+        stale_lbl = out_root / "labels" / "train"
+        stale = []
+        if stale_img.exists() and any(stale_img.iterdir()):
+            stale.append(str(stale_img))
+        if stale_lbl.exists() and any(stale_lbl.iterdir()):
+            stale.append(str(stale_lbl))
+        if stale:
+            raise RuntimeError(
+                f"Output directory is non-empty: {stale}\n"
+                "Rerunning without --clean would silently merge stale retrieval results.\n"
+                "Pass --clean to remove and rebuild, or delete the output manually."
+            )
+
     out_root.mkdir(parents=True, exist_ok=True)
 
     # Candidate target class filter
@@ -958,10 +998,20 @@ def main_new(args: argparse.Namespace) -> None:
     except ImportError:
         pass
 
-    if embedding_layers != [9]:  # multi-layer mode
-        if not has_rtdetr:
-            print(f"  WARNING: --embedding-layers {embedding_layers} specified but no RTDETRDecoder found.")
-            print("  For YOLO models, use --embedding-layers 9 (single layer).")
+    # For the P2-A1 default multi-scale layers [21, 24, 27], require RT-DETR.
+    # These layer indices are specific to rtdetr-l.yaml and do not exist in YOLO models.
+    _P2A1_RTDETR_LAYERS = [21, 24, 27]
+    if sorted(embedding_layers) == sorted(_P2A1_RTDETR_LAYERS) and not has_rtdetr:
+        raise RuntimeError(
+            f"HARD FAIL: --embedding-layers {embedding_layers} require an RT-DETR model "
+            "(layers 21/24/27 are RT-DETR P3/P4/P5 RepC3 head features), "
+            "but RTDETRDecoder was NOT found in the loaded checkpoint.\n"
+            "For YOLO models use --embedding-layers 9. "
+            "For RT-DETR, ensure you pass the correct best.pt."
+        )
+    if embedding_layers != [9] and not has_rtdetr:
+        print(f"  WARNING: --embedding-layers {embedding_layers} with non-RT-DETR model. "
+              "Continuing — hooks may still fire if layers exist.")
     model_type_str = "RT-DETR-L (RTDETRDecoder detected)" if has_rtdetr else "YOLO/other"
     print(f"  Model type: {model_type_str}")
 
@@ -971,7 +1021,7 @@ def main_new(args: argparse.Namespace) -> None:
     cache_path = args.cache_pool_embs
     pool_embs = None
     if cache_path:
-        expected_meta = _cache_fingerprint(args.weights, embedding_layers, IMGSZ, len(pool_paths))
+        expected_meta = _cache_fingerprint(args.weights, embedding_layers, IMGSZ, pool_paths)
         cached = load_pool_cache(cache_path, expected_meta)
         if cached is not None:
             pool_embs, pool_paths = cached
@@ -981,7 +1031,7 @@ def main_new(args: argparse.Namespace) -> None:
             batch_size=args.batch_size, device=device, has_rtdetr=has_rtdetr,
         )
         if cache_path:
-            expected_meta = _cache_fingerprint(args.weights, embedding_layers, IMGSZ, len(pool_paths))
+            expected_meta = _cache_fingerprint(args.weights, embedding_layers, IMGSZ, pool_paths)
             save_pool_cache(cache_path, pool_embs, pool_paths, expected_meta)
 
     # Hard sample mining from all query dirs
@@ -1131,6 +1181,27 @@ def main_new(args: argparse.Namespace) -> None:
         writer.writeheader()
         writer.writerows(manifest_rows)
 
+    # Output count invariants
+    output_img_count = sum(
+        1 for p in out_img_dir.iterdir()
+        if p.suffix.lower() in IMAGE_EXTS and (p.is_file() or p.is_symlink())
+    )
+    output_lbl_count = sum(
+        1 for p in out_lbl_dir.iterdir()
+        if p.suffix.lower() == ".txt" and (p.is_file() or p.is_symlink())
+    )
+    manifest_row_count = len(manifest_rows)
+    selected_unique = len(selected)
+    if output_img_count != selected_unique:
+        raise RuntimeError(
+            f"OUTPUT COUNT MISMATCH: wrote {output_img_count} images but selected_unique={selected_unique}. "
+            "Stale files may be present. Pass --clean and rerun."
+        )
+    if manifest_row_count != selected_unique:
+        raise RuntimeError(
+            f"MANIFEST COUNT MISMATCH: {manifest_row_count} rows but selected_unique={selected_unique}."
+        )
+
     # retrieval_stats.json
     source_split_counts = {"bdd_train": len(selected)}
     stats = {
@@ -1154,6 +1225,9 @@ def main_new(args: argparse.Namespace) -> None:
         "source_split_counts": source_split_counts,
         "embedding_layers": embedding_layers,
         "embedding_dim": embedding_dim,
+        "output_image_count": output_img_count,
+        "output_label_count": output_lbl_count,
+        "manifest_row_count": manifest_row_count,
     }
     (out_root / "retrieval_stats.json").write_text(
         json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8"

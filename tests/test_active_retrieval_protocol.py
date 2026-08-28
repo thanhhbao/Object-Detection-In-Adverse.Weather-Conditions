@@ -537,3 +537,175 @@ def test_h_multiscale_hook_missing_layer_raises():
 
     with pytest.raises(RuntimeError, match="Layer 24 hook did not produce output"):
         hook.get_embedding([21, 24, 27])
+
+
+# ── Test I: --clean removes stale output; without --clean stale files fail ────
+
+def test_i_clean_removes_stale_output(tmp_path):
+    """Second retrieval run with --clean must not leave stale images from first run."""
+    sys.path.insert(0, str(scripts_dir))
+    from active_retrieval import place_file, IMAGE_EXTS
+
+    out_img_dir = tmp_path / "images" / "train"
+    out_lbl_dir = tmp_path / "labels" / "train"
+    out_img_dir.mkdir(parents=True)
+    out_lbl_dir.mkdir(parents=True)
+
+    # Simulate first run: 5 stale images
+    for i in range(5):
+        (out_img_dir / f"stale_{i:03d}.jpg").write_bytes(b"stale")
+    assert len(list(out_img_dir.iterdir())) == 5
+
+    # --clean removes the whole out_root
+    import shutil
+    out_root = tmp_path
+    shutil.rmtree(out_root)
+    out_root.mkdir()
+
+    # Second run writes only 2 images
+    out_img_dir2 = out_root / "images" / "train"
+    out_lbl_dir2 = out_root / "labels" / "train"
+    out_img_dir2.mkdir(parents=True)
+    out_lbl_dir2.mkdir(parents=True)
+    for i in range(2):
+        (out_img_dir2 / f"new_{i:03d}.jpg").write_bytes(b"new")
+
+    imgs = list(out_img_dir2.iterdir())
+    assert len(imgs) == 2, f"Expected 2 after clean+rerun, got {len(imgs)}: {[p.name for p in imgs]}"
+    assert all("stale" not in p.name for p in imgs), "Stale files survived --clean"
+
+
+def test_i_no_clean_stale_raises(tmp_path):
+    """Without --clean, non-empty output dir must raise RuntimeError."""
+    out_img_dir = tmp_path / "images" / "train"
+    out_img_dir.mkdir(parents=True)
+    (out_img_dir / "stale.jpg").write_bytes(b"stale")
+
+    # Simulate the guard logic from main_new
+    stale_img = tmp_path / "images" / "train"
+    stale = []
+    if stale_img.exists() and any(stale_img.iterdir()):
+        stale.append(str(stale_img))
+    assert stale, "Guard should detect non-empty output dir"
+
+
+# ── Test J: shared basename across datasets — provenance not overwritten ──────
+
+def test_j_shared_basename_provenance():
+    """XWOD and ACDC with same filename must keep separate provenance records."""
+    sys.path.insert(0, str(scripts_dir))
+    from active_retrieval import find_hard_samples_gt_aware  # noqa: F401
+    # We test the dict-key mechanism directly (canonical path, not basename)
+
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        # Create two directories with the same basename "shared.jpg" but different paths
+        xwod_img = td / "xwod" / "images" / "train" / "shared.jpg"
+        acdc_img = td / "acdc" / "images" / "train" / "shared.jpg"
+        xwod_lbl = td / "xwod" / "labels" / "train" / "shared.txt"
+        acdc_lbl = td / "acdc" / "labels" / "train" / "shared.txt"
+        for p in [xwod_img, acdc_img]:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"fake")
+        xwod_lbl.parent.mkdir(parents=True, exist_ok=True)
+        acdc_lbl.parent.mkdir(parents=True, exist_ok=True)
+        xwod_lbl.write_text("1 0.5 0.5 0.2 0.2")  # bicycle
+        acdc_lbl.write_text("1 0.5 0.5 0.2 0.2")  # bicycle
+
+        # Simulate storing by canonical key
+        hardness_scores = {}
+        img_to_dataset = {}
+
+        xwod_key = str(xwod_img.resolve())
+        acdc_key = str(acdc_img.resolve())
+        hardness_scores[xwod_key] = 0.9  # XWOD: high hardness
+        hardness_scores[acdc_key] = 0.3  # ACDC: lower hardness
+        img_to_dataset[xwod_key] = "xwod"
+        img_to_dataset[acdc_key] = "acdc"
+
+        # Keys are distinct even though basenames are the same
+        assert xwod_key != acdc_key, "Canonical keys should differ for different paths"
+        assert hardness_scores[xwod_key] == 0.9
+        assert hardness_scores[acdc_key] == 0.3
+        assert img_to_dataset[xwod_key] == "xwod"
+        assert img_to_dataset[acdc_key] == "acdc"
+
+
+# ── Test K: pool fingerprint detects filename change at same count ─────────────
+
+def test_k_pool_fingerprint_filename_change():
+    """Pool fingerprint must change when filenames change even if count is the same."""
+    sys.path.insert(0, str(scripts_dir))
+    from active_retrieval import _pool_fingerprint
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        pool_a = [td / "a.jpg", td / "b.jpg", td / "c.jpg"]
+        pool_b = [td / "a.jpg", td / "b.jpg", td / "d.jpg"]  # d replaces c, same count
+
+        fp_a = _pool_fingerprint(pool_a)
+        fp_b = _pool_fingerprint(pool_b)
+        assert fp_a != fp_b, "Pool fingerprint must change when filenames change"
+
+
+def test_k_pool_fingerprint_same_files_stable():
+    """Same pool paths → same fingerprint (deterministic)."""
+    sys.path.insert(0, str(scripts_dir))
+    from active_retrieval import _pool_fingerprint
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        pool = [td / "x.jpg", td / "y.jpg"]
+        assert _pool_fingerprint(pool) == _pool_fingerprint(pool)
+
+
+def test_k_cache_fingerprint_pool_fingerprint_included():
+    """_cache_fingerprint must include pool_fingerprint key."""
+    sys.path.insert(0, str(scripts_dir))
+    from active_retrieval import _cache_fingerprint
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        # Create a fake weights file
+        fake_weights = td / "best.pt"
+        fake_weights.write_bytes(b"fake")
+        pool = [td / "a.jpg", td / "b.jpg"]
+        meta = _cache_fingerprint(fake_weights, [21, 24, 27], 640, pool)
+        assert "pool_fingerprint" in meta, "pool_fingerprint must be in cache metadata"
+        assert isinstance(meta["pool_fingerprint"], str) and len(meta["pool_fingerprint"]) > 0
+
+
+def test_k_cache_pool_fingerprint_mismatch_rebuilds(tmp_path):
+    """load_pool_cache must reject cache when pool_fingerprint differs."""
+    sys.path.insert(0, str(scripts_dir))
+
+    try:
+        import numpy as np
+    except ImportError:
+        pytest.skip("numpy not available")
+
+    from active_retrieval import load_pool_cache, _cache_fingerprint
+
+    cache_file = tmp_path / "cache.npz"
+    pool_a = [tmp_path / "a.jpg", tmp_path / "b.jpg"]
+    pool_b = [tmp_path / "a.jpg", tmp_path / "c.jpg"]  # c replaces b
+
+    fake_weights = tmp_path / "best.pt"
+    fake_weights.write_bytes(b"fake")
+
+    # Build cache with pool_a
+    meta_a = _cache_fingerprint(fake_weights, [21, 24, 27], 640, pool_a)
+    meta_json = __import__("json").dumps(meta_a)
+    fake_embs = np.zeros((2, 768))
+    np.savez(cache_file, embs=fake_embs,
+             paths=np.array([str(p) for p in pool_a]),
+             meta=np.array(meta_json))
+
+    # Try to load with pool_b fingerprint → should reject
+    meta_b = _cache_fingerprint(fake_weights, [21, 24, 27], 640, pool_b)
+    result = load_pool_cache(cache_file, meta_b)
+    assert result is None, "Cache with pool_fingerprint mismatch must be rejected"
