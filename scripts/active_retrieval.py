@@ -1197,6 +1197,11 @@ def main_new(args: argparse.Namespace) -> None:
             f"OUTPUT COUNT MISMATCH: wrote {output_img_count} images but selected_unique={selected_unique}. "
             "Stale files may be present. Pass --clean and rerun."
         )
+    if output_lbl_count != selected_unique:
+        raise RuntimeError(
+            f"OUTPUT LABEL COUNT MISMATCH: wrote {output_lbl_count} labels but selected_unique={selected_unique}. "
+            "Every retrieved BDD image must have exactly one corresponding label."
+        )
     if manifest_row_count != selected_unique:
         raise RuntimeError(
             f"MANIFEST COUNT MISMATCH: {manifest_row_count} rows but selected_unique={selected_unique}."

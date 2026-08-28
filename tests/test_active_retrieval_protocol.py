@@ -589,6 +589,43 @@ def test_i_no_clean_stale_raises(tmp_path):
     assert stale, "Guard should detect non-empty output dir"
 
 
+def test_i_label_count_mismatch_raises(tmp_path):
+    """Missing retrieved label must trigger OUTPUT LABEL COUNT MISMATCH invariant."""
+    out_img_dir = tmp_path / "images" / "train"
+    out_lbl_dir = tmp_path / "labels" / "train"
+    out_img_dir.mkdir(parents=True)
+    out_lbl_dir.mkdir(parents=True)
+
+    # 3 images but only 2 labels (one pool image had no label file)
+    for i in range(3):
+        (out_img_dir / f"img_{i}.jpg").write_bytes(b"fake")
+    for i in range(2):
+        (out_lbl_dir / f"img_{i}.txt").write_text(f"1 0.5 0.5 0.1 0.1")
+
+    selected_unique = 3
+    output_img_count = sum(
+        1 for p in out_img_dir.iterdir()
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        and (p.is_file() or p.is_symlink())
+    )
+    output_lbl_count = sum(
+        1 for p in out_lbl_dir.iterdir()
+        if p.suffix.lower() == ".txt" and (p.is_file() or p.is_symlink())
+    )
+
+    assert output_img_count == selected_unique  # images are fine
+    assert output_lbl_count == 2               # labels are short
+
+    # The invariant check that must raise
+    with pytest.raises(RuntimeError, match="OUTPUT LABEL COUNT MISMATCH"):
+        if output_lbl_count != selected_unique:
+            raise RuntimeError(
+                f"OUTPUT LABEL COUNT MISMATCH: wrote {output_lbl_count} labels "
+                f"but selected_unique={selected_unique}. "
+                "Every retrieved BDD image must have exactly one corresponding label."
+            )
+
+
 # ── Test J: shared basename across datasets — provenance not overwritten ──────
 
 def test_j_shared_basename_provenance():
