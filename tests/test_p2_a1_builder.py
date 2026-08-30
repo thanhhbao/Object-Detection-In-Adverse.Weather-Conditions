@@ -246,3 +246,182 @@ def test_manifest_has_bdd_retrieved_source(tmp_path):
     rows = list(csv.DictReader((out / "manifest.csv").open(encoding="utf-8")))
     sources = {r["source_dataset"] for r in rows}
     assert "bdd_retrieved" in sources, f"bdd_retrieved not in manifest sources: {sources}"
+
+
+# ── Tests for --exclude-retrieved-from-oversampling ───────────────────────────
+
+def _make_rare_retrieved(tmp_path: Path, n: int = 3, classes: list[int] | None = None) -> Path:
+    """Create retrieved images with rare classes (default: bus=4, oversampling multiplier 3)."""
+    if classes is None:
+        classes = [4]  # bus → multiplier 3
+    retrieved = tmp_path / "retrieved_rare"
+    for i in range(n):
+        _write_pair(
+            retrieved / "images" / "train",
+            retrieved / "labels" / "train",
+            f"ret_{i:03d}", classes,
+        )
+    return retrieved
+
+
+def _count_files_in(directory: Path, suffix: str) -> int:
+    if not directory.exists():
+        return 0
+    return sum(1 for f in directory.iterdir() if f.suffix == suffix)
+
+
+def test_excl_retrieved_skips_retrieved_bdd_oversampling(tmp_path):
+    """--exclude-retrieved-from-oversampling: retrieved_bdd_* images must NOT be oversampled."""
+    xwod, acdc, bdd = _make_sources(tmp_path)
+    # bus-only retrieved images would normally be oversampled 3x (+2 duplicates each)
+    retrieved = _make_rare_retrieved(tmp_path, n=2, classes=[4])
+    out = tmp_path / "merged"
+
+    _run_build([
+        "--xwod-root", str(xwod), "--acdc-root", str(acdc), "--bdd-root", str(bdd),
+        "--retrieved-root", str(retrieved),
+        "--out-root", str(out), "--bdd-use-all",
+        "--seed", "42", "--mode", "copy",
+        "--oversample-rare", "--exclude-retrieved-from-oversampling",
+        "--clean",
+    ])
+
+    stats = json.loads((out / "stats.json").read_text())
+
+    # Verify the flag is recorded in stats
+    assert stats["oversample_rare"]["exclude_retrieved_from_oversampling"] is True
+    assert stats["oversample_rare"]["retrieved_prefix_excluded"] == "retrieved_bdd_"
+
+    # Count oversampled copies: retrieved_bdd_ret_000_os*.jpg must NOT exist
+    train_img_dir = out / "images" / "train"
+    os_retrieved = list(train_img_dir.glob("retrieved_bdd_*_os*.jpg"))
+    assert len(os_retrieved) == 0, (
+        f"retrieved_bdd_* images should not be oversampled, found: {[f.name for f in os_retrieved]}"
+    )
+
+
+def test_excl_retrieved_preserves_base_oversampling(tmp_path):
+    """--exclude-retrieved-from-oversampling must NOT change oversampling of base images."""
+    xwod, acdc, bdd = _make_sources(tmp_path)
+
+    # Make XWOD with known rare class composition to count duplicates
+    xwod2 = tmp_path / "xwod2"
+    # 1 bicycle (mult 2): +1 dup; 1 bus (mult 3): +2 dups; total +3 base dups
+    _make_source(xwod2, {
+        "train": [[1], [4], [0]],   # bicycle, bus, person
+        "val": [[0]],
+    })
+    retrieved = _make_rare_retrieved(tmp_path, n=1, classes=[4])  # bus: would add +2 if not excluded
+    out_with = tmp_path / "merged_with_excl"
+    out_without = tmp_path / "merged_without_excl"
+
+    base_args = [
+        "--xwod-root", str(xwod2), "--bdd-root", str(bdd),
+        "--out-root", str(out_with), "--bdd-use-all",
+        "--seed", "42", "--mode", "copy",
+        "--oversample-rare", "--retrieved-root", str(retrieved),
+    ]
+    _run_build(base_args + ["--exclude-retrieved-from-oversampling", "--clean"])
+
+    # Without retrieved, count base duplicates
+    out_base = tmp_path / "merged_base_only"
+    _run_build([
+        "--xwod-root", str(xwod2), "--bdd-root", str(bdd),
+        "--out-root", str(out_base), "--bdd-use-all",
+        "--seed", "42", "--mode", "copy",
+        "--oversample-rare", "--clean",
+    ])
+
+    stats_with = json.loads((out_with / "stats.json").read_text())
+    stats_base = json.loads((out_base / "stats.json").read_text())
+
+    # Base duplicate count must be identical (retrieved exclusion leaves base untouched)
+    assert stats_with["oversample_rare"]["duplicate_images"] == \
+           stats_base["oversample_rare"]["duplicate_images"], (
+        f"Base duplicates changed: with={stats_with['oversample_rare']['duplicate_images']}, "
+        f"base={stats_base['oversample_rare']['duplicate_images']}"
+    )
+
+
+def test_excl_retrieved_without_flag_oversample_all(tmp_path):
+    """Default behavior (no --exclude-retrieved-from-oversampling): all images are oversampled."""
+    xwod, acdc, bdd = _make_sources(tmp_path)
+    # 2 bus images in retrieved → each would get +2 duplicates = +4 total if oversampled
+    retrieved = _make_rare_retrieved(tmp_path, n=2, classes=[4])
+    out = tmp_path / "merged_no_excl"
+
+    _run_build([
+        "--xwod-root", str(xwod), "--acdc-root", str(acdc), "--bdd-root", str(bdd),
+        "--retrieved-root", str(retrieved),
+        "--out-root", str(out), "--bdd-use-all",
+        "--seed", "42", "--mode", "copy",
+        "--oversample-rare",
+        "--clean",
+    ])
+
+    stats = json.loads((out / "stats.json").read_text())
+
+    # Flag should be False / absent in old mode
+    assert stats["oversample_rare"]["exclude_retrieved_from_oversampling"] is False
+    # retrieved_bdd_*_os*.jpg must exist because retrieved images ARE oversampled by default
+    train_img_dir = out / "images" / "train"
+    os_retrieved = list(train_img_dir.glob("retrieved_bdd_*_os*.jpg"))
+    # Each bus image gets +2 copies → 2 images * 2 copies = 4 extra
+    assert len(os_retrieved) == 4, (
+        f"Without exclusion, retrieved bus images should be oversampled (+2 each × 2 = 4 copies), "
+        f"found {len(os_retrieved)}: {[f.name for f in os_retrieved]}"
+    )
+
+
+def test_excl_retrieved_cross_arm_duplicate_parity(tmp_path):
+    """A0R and A1-DINO arms with different retrieved class composition must have identical duplicates."""
+    xwod, acdc, bdd = _make_sources(tmp_path)
+
+    # Arm A: retrieved images are all-bus (heavy rare class mix if included)
+    retrieved_a = _make_rare_retrieved(tmp_path / "a", n=3, classes=[4])  # bus ×3
+    # Arm B: retrieved images are all-person (no rare class)
+    retrieved_b = tmp_path / "retrieved_b"
+    for i in range(3):
+        _write_pair(
+            retrieved_b / "images" / "train",
+            retrieved_b / "labels" / "train",
+            f"ret_{i:03d}", [0],  # person only
+        )
+
+    out_a = tmp_path / "merged_a"
+    out_b = tmp_path / "merged_b"
+
+    common = [
+        "--xwod-root", str(xwod), "--acdc-root", str(acdc), "--bdd-root", str(bdd),
+        "--bdd-use-all", "--seed", "42", "--mode", "copy",
+        "--oversample-rare", "--exclude-retrieved-from-oversampling", "--clean",
+    ]
+    _run_build(common + ["--retrieved-root", str(retrieved_a), "--out-root", str(out_a)])
+    _run_build(common + ["--retrieved-root", str(retrieved_b), "--out-root", str(out_b)])
+
+    stats_a = json.loads((out_a / "stats.json").read_text())
+    stats_b = json.loads((out_b / "stats.json").read_text())
+
+    dup_a = stats_a["oversample_rare"]["duplicate_images"]
+    dup_b = stats_b["oversample_rare"]["duplicate_images"]
+    assert dup_a == dup_b, (
+        f"Duplicate count must match across arms (--exclude-retrieved-from-oversampling), "
+        f"but A={dup_a} != B={dup_b}"
+    )
+
+    train_a = stats_a["train_total"]
+    train_b = stats_b["train_total"]
+    assert train_a == train_b, (
+        f"Final train_total must match across arms, but A={train_a} != B={train_b}"
+    )
+
+
+def test_excl_retrieved_expected_55985_count(tmp_path):
+    """Verify exact count arithmetic: 37188 + 5000 + 13797 = 55985."""
+    # This is a pure arithmetic test — no subprocess needed.
+    base = 37188   # XWOD(6006) + ACDC(1182) + BDD30K(30000)
+    retrieved = 5000
+    dups = 13797   # official Phase2 oversampling duplicates
+    expected_train = base + retrieved + dups
+    assert expected_train == 55985, f"Arithmetic check failed: {expected_train} != 55985"
+    assert base + retrieved == 42188, "Pre-oversampling total must be 42188"

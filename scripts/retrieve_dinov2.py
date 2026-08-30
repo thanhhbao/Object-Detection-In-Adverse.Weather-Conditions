@@ -84,6 +84,13 @@ CLASS_NAMES = ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
 DINOV2_DIM = {"dinov2_vits14": 384, "dinov2_vitb14": 768, "dinov2_vitl14": 1024}
 DINOV2_CHOICES = list(DINOV2_DIM.keys())
 
+# HuggingFace model IDs for fallback when torch.hub is unavailable
+_DINOV2_HF_IDS = {
+    "dinov2_vits14": "facebook/dinov2-small",
+    "dinov2_vitb14": "facebook/dinov2-base",
+    "dinov2_vitl14": "facebook/dinov2-large",
+}
+
 
 # ── Imports from active_retrieval ──────────────────────────────────────────────
 
@@ -110,17 +117,68 @@ def _infer_query_dataset(query_root: Path) -> str:
 
 # ── DINOv2 loading ─────────────────────────────────────────────────────────────
 
+class _HFDINOv2Wrapper:
+    """Wraps a HuggingFace DINOv2 model to match the torch.hub forward contract.
+
+    torch.hub DINOv2 returns [B, D] directly.
+    HuggingFace DINOv2 returns a BaseModelOutputWithPooling;
+    the CLS token is last_hidden_state[:, 0] — shape [B, D].
+    """
+
+    def __init__(self, hf_model):
+        self._model = hf_model
+
+    def __call__(self, pixel_values):
+        outputs = self._model(pixel_values=pixel_values)
+        return outputs.last_hidden_state[:, 0]  # CLS token → [B, D]
+
+    def eval(self):
+        self._model.eval()
+        return self
+
+    def to(self, device):
+        self._model.to(device)
+        return self
+
+
 def load_dinov2(model_name: str, device: str):
-    """Load DINOv2 model from torch.hub, with transformers fallback."""
+    """Load DINOv2 model. Primary: torch.hub. Fallback: HuggingFace transformers.
+
+    Both backends are wrapped to return [B, D] float tensors from a [B, 3, H, W] input.
+    Raises RuntimeError with both failure reasons if neither backend succeeds.
+    """
+    hub_err: Exception | None = None
+    hf_err: Exception | None = None
+
+    # Primary: torch.hub (facebookresearch/dinov2)
     try:
         model = torch.hub.load('facebookresearch/dinov2', model_name, verbose=False)
-    except Exception:
-        # Fallback: try transformers
+        model.eval().to(device)
+        return model
+    except Exception as e:
+        hub_err = e
+
+    # Fallback: HuggingFace transformers with correct model ID mapping
+    try:
         from transformers import AutoModel  # type: ignore[import]
-        model = AutoModel.from_pretrained(f'facebook/{model_name}')
-    model.eval()
-    model.to(device)
-    return model
+        hf_id = _DINOV2_HF_IDS.get(model_name)
+        if hf_id is None:
+            raise ValueError(f"No HuggingFace ID mapping for model_name={model_name!r}")
+        hf_model = AutoModel.from_pretrained(hf_id)
+        wrapper = _HFDINOv2Wrapper(hf_model)
+        wrapper.eval().to(device)
+        print(f"  torch.hub failed ({hub_err}); loaded DINOv2 from HuggingFace ({hf_id})")
+        return wrapper
+    except Exception as e:
+        hf_err = e
+
+    raise RuntimeError(
+        f"Failed to load DINOv2 model '{model_name}' from both backends.\n"
+        f"  torch.hub error:     {hub_err}\n"
+        f"  HuggingFace error:   {hf_err}\n"
+        "Install torch.hub access (internet + facebookresearch/dinov2) or "
+        "'pip install transformers' with network access."
+    )
 
 
 # ── DINOv2 embedding extraction ────────────────────────────────────────────────

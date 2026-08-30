@@ -121,12 +121,22 @@ def classes_in_label(label_path: Path) -> set[str]:
     return present
 
 
-def oversample_rare(out_img_dir: Path, out_lbl_dir: Path, mode: str,
-                    manifest_rows: list[dict]) -> tuple[int, Counter, dict]:
+def oversample_rare(
+    out_img_dir: Path,
+    out_lbl_dir: Path,
+    mode: str,
+    manifest_rows: list[dict],
+    exclude_prefix: "str | None" = None,
+) -> tuple[int, Counter, dict]:
     """Duplicate already-written TRAIN images that contain rare classes.
 
     Multiplier per image = max RARE_MULTIPLIERS over the rare classes it contains
     (1 if none). Creates (mult-1) extra copies suffixed _osK.
+
+    When exclude_prefix is set (e.g. "retrieved_bdd_"), any label whose stem starts
+    with that prefix is skipped — it is counted in mult_dist but not oversampled.
+    This keeps the base Phase2 duplicate count stable across ablation arms.
+
     Returns (duplicate_images, duplicate_boxes_per_class, multiplier_distribution).
     """
     dup_images = 0
@@ -137,6 +147,9 @@ def oversample_rare(out_img_dir: Path, out_lbl_dir: Path, mode: str,
         mult = max((RARE_MULTIPLIERS[c] for c in present if c in RARE_MULTIPLIERS), default=1)
         mult_dist[mult] += 1
         if mult <= 1:
+            continue
+        # Skip retrieved images from oversampling when requested
+        if exclude_prefix and lbl.stem.startswith(exclude_prefix):
             continue
         imgs = list(out_img_dir.glob(f"{lbl.stem}.*"))
         if not imgs:
@@ -223,6 +236,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--oversample-rare", action="store_true",
                     help="Duplicate train images containing rare classes "
                          "(bicycle x2, motorcycle x3, bus x3). Does not touch val/test.")
+    ap.add_argument("--exclude-retrieved-from-oversampling", action="store_true",
+                    help="When --oversample-rare is enabled, skip oversampling for any image "
+                         "whose merged filename starts with 'retrieved_bdd_'. "
+                         "Preserves the exact official Phase2 duplicate count across ablation arms. "
+                         "Default: off (unchanged behaviour). Only meaningful with --retrieved-root.")
     ap.add_argument("--clean", action="store_true", help="Remove --out-root if it exists")
     return ap.parse_args()
 
@@ -321,9 +339,14 @@ def main() -> None:
     dup_boxes: Counter = Counter()
     mult_dist: dict = {}
     if args.oversample_rare:
+        excl_prefix = "retrieved_bdd_" if args.exclude_retrieved_from_oversampling else None
         dup_images, dup_boxes, mult_dist = oversample_rare(
-            out_train_img, out_train_lbl, args.mode, manifest_rows)
-        print(f"Oversampling rare classes {RARE_MULTIPLIERS}: +{dup_images} duplicate images.")
+            out_train_img, out_train_lbl, args.mode, manifest_rows, exclude_prefix=excl_prefix)
+        if excl_prefix:
+            print(f"Oversampling rare classes {RARE_MULTIPLIERS}: +{dup_images} duplicate images "
+                  f"(retrieved_bdd_* excluded from oversampling).")
+        else:
+            print(f"Oversampling rare classes {RARE_MULTIPLIERS}: +{dup_images} duplicate images.")
 
     after_class_counter = train_class_counter + dup_boxes
     after_train_total = base_train_total + dup_images
@@ -371,6 +394,8 @@ def main() -> None:
         "images_per_source": images_per_source,
         "oversample_rare": {
             "enabled": args.oversample_rare,
+            "exclude_retrieved_from_oversampling": args.exclude_retrieved_from_oversampling,
+            "retrieved_prefix_excluded": "retrieved_bdd_" if args.exclude_retrieved_from_oversampling else None,
             "multipliers": RARE_MULTIPLIERS if args.oversample_rare else {},
             "base_train_images": base_train_total,
             "duplicate_images": dup_images,
