@@ -10,3 +10,7 @@ datasets:
   bdd_remaining_pool: /workspace/datasets_noleak/bdd_remaining_pool/dataset.yaml
   bdd_active_retrieved: /workspace/datasets_noleak/bdd_active_retrieved/dataset.yaml
   phase2_a1_merged: /workspace/datasets_noleak/phase2_a1_merged_yolo/dataset.yaml
+  bdd_random_rare: /workspace/datasets_noleak/bdd_random_rare/dataset.yaml
+  phase2_a0r_merged: /workspace/datasets_noleak/phase2_a0r_merged_yolo/dataset.yaml
+  bdd_dinov2_retrieved: /workspace/datasets_noleak/bdd_dinov2_retrieved/dataset.yaml
+  phase2_a1_dino_merged: /workspace/datasets_noleak/phase2_a1_dino_merged_yolo/dataset.yaml
