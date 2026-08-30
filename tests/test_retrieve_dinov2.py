@@ -7,8 +7,11 @@ No GPU, no real DINOv2. Tests cover:
 - Test D: output count invariants (image == label == manifest == selected_unique)
 - Test E: overlap_with_used_bdd == 0 enforced
 - Test F: DINOv2 cache metadata includes required fields
-- Test G: determinism — same pool, same seed, same model → identical selection
+- Test G: threshold-diagnostic-only — threshold=0.0 vs threshold=0.999 produce same global top-N
 - Test H: filter_pool_by_class excludes car-only images
+- Test I: exact top_k guarantee — hard-fail if pool < top_k
+- Test J: retrieval_stats.json contains all required similarity and provenance fields
+- Test K: dinov2_smoke_check raises on bad embedding (non-finite / wrong norm)
 """
 
 from __future__ import annotations
@@ -41,7 +44,6 @@ def test_A_validate_query_root_rejects_val(tmp_path):
 
     val_dir = tmp_path / "mydataset" / "images" / "val"
     val_dir.mkdir(parents=True, exist_ok=True)
-    # also create labels/val so it doesn't fail on missing labels
     (tmp_path / "mydataset" / "labels" / "val").mkdir(parents=True, exist_ok=True)
 
     with pytest.raises(SystemExit):
@@ -80,14 +82,12 @@ def test_B_pool_fingerprint_in_dinov2_cache_meta(tmp_path):
     from active_retrieval import _pool_fingerprint
     import retrieve_dinov2 as rd
 
-    # Create fake pool files
     pool_paths = []
     for i in range(5):
         p = tmp_path / f"img_{i:03d}.jpg"
         p.write_bytes(b"fake")
         pool_paths.append(p)
 
-    # Build fake weights file
     weights = tmp_path / "best.pt"
     weights.write_bytes(b"fake_checkpoint" * 100)
 
@@ -114,7 +114,6 @@ def test_C_clean_removes_stale_output(tmp_path):
 
     assert stale_file.exists()
 
-    # Simulate --clean logic
     if out_root.exists():
         shutil.rmtree(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -130,7 +129,6 @@ def test_C_without_clean_fails_if_non_empty(tmp_path):
     stale_img.mkdir(parents=True, exist_ok=True)
     (stale_img / "stale.jpg").write_bytes(b"stale")
 
-    # Simulate the guard logic from retrieve_dinov2.py
     stale = []
     if stale_img.exists() and any(stale_img.iterdir()):
         stale.append(str(stale_img))
@@ -149,7 +147,6 @@ def test_D_output_count_invariant_passes_when_equal():
     manifest_row_count = 10
     selected_unique = 10
 
-    # Should not raise
     if output_img_count != selected_unique:
         raise RuntimeError("image count mismatch")
     if output_lbl_count != selected_unique:
@@ -204,7 +201,6 @@ def test_E_overlap_check_passes_when_disjoint():
     used_bdd_names = {"img100.jpg", "img200.jpg"}
 
     overlap = selected_names & used_bdd_names
-    # Should not raise
     assert len(overlap) == 0
 
 
@@ -234,13 +230,63 @@ def test_F_dinov2_cache_meta_required_fields(tmp_path):
     assert meta["version"] == 1
 
 
-# ── Test G: determinism — same inputs → same order ───────────────────────────
+# ── Test G: threshold-diagnostic-only — same top-N regardless of threshold ───
 
-def test_G_retrieval_determinism():
-    """Same pool embeddings, same hard embeddings, same seed → identical selection order."""
+def test_G_threshold_does_not_change_selection():
+    """
+    threshold is DIAGNOSTIC ONLY: top-N selection must be identical for
+    threshold=0.0 and threshold=0.999 because threshold does not filter.
+    """
     np = pytest.importorskip("numpy")
     import retrieve_dinov2 as rd
-    from pathlib import Path
+
+    rng = np.random.RandomState(7)
+    n_pool = 30
+    n_hard = 4
+    dim = 8
+    top_n = 10
+
+    pool_embs = rng.randn(n_pool, dim).astype(np.float32)
+    pool_embs /= np.linalg.norm(pool_embs, axis=1, keepdims=True)
+    hard_embs = rng.randn(n_hard, dim).astype(np.float32)
+    hard_embs /= np.linalg.norm(hard_embs, axis=1, keepdims=True)
+
+    pool_paths = [Path(f"/fake/pool_{i:03d}.jpg") for i in range(n_pool)]
+    hard_paths = [Path(f"/fake/hard_{i}.jpg") for i in range(n_hard)]
+    hardness = {str(p.resolve()): 0.9 for p in hard_paths}
+    img_to_ds = {str(p.resolve()): "xwod" for p in hard_paths}
+
+    sel_low, stats_low = rd.retrieve_dinov2(
+        hard_embs, hard_paths, hardness, img_to_ds,
+        pool_embs, pool_paths, sim_threshold=0.0, top_n=top_n
+    )
+    sel_high, stats_high = rd.retrieve_dinov2(
+        hard_embs, hard_paths, hardness, img_to_ds,
+        pool_embs, pool_paths, sim_threshold=0.999, top_n=top_n
+    )
+
+    names_low = [e["pool_path"].name for e in sel_low]
+    names_high = [e["pool_path"].name for e in sel_high]
+    assert names_low == names_high, (
+        f"threshold changed selection — must be diagnostic only.\n"
+        f"  low:  {names_low}\n  high: {names_high}"
+    )
+    # Both must produce exactly top_n results
+    assert len(sel_low) == top_n
+    assert len(sel_high) == top_n
+
+    # threshold_is_diagnostic_only must be True in both stats dicts
+    assert stats_low.get("threshold_is_diagnostic_only") is True
+    assert stats_high.get("threshold_is_diagnostic_only") is True
+
+    # Diagnostic counts differ (more hits at lower threshold)
+    assert stats_low["candidate_hits_above_threshold"] >= stats_high["candidate_hits_above_threshold"]
+
+
+def test_G_retrieval_determinism():
+    """Same pool embeddings, same hard embeddings → identical selection order."""
+    np = pytest.importorskip("numpy")
+    import retrieve_dinov2 as rd
 
     rng = np.random.RandomState(42)
     n_pool = 20
@@ -278,19 +324,15 @@ def test_H_filter_pool_excludes_car_only(tmp_path):
     pool_img.mkdir(parents=True, exist_ok=True)
     pool_lbl.mkdir(parents=True, exist_ok=True)
 
-    # car only (class 2) — should be excluded
     _write_image(pool_img / "car_only.jpg")
     _write_label(pool_lbl / "car_only.txt", [2])
 
-    # bicycle (class 1) — should be included
     _write_image(pool_img / "has_bicycle.jpg")
     _write_label(pool_lbl / "has_bicycle.txt", [1, 2])
 
-    # motorcycle (class 3) — should be included
     _write_image(pool_img / "has_moto.jpg")
     _write_label(pool_lbl / "has_moto.txt", [3])
 
-    # bus (class 4) — should be included
     _write_image(pool_img / "has_bus.jpg")
     _write_label(pool_lbl / "has_bus.txt", [4, 2])
 
@@ -304,3 +346,191 @@ def test_H_filter_pool_excludes_car_only(tmp_path):
     assert "has_bus.jpg" in filtered_names
     assert before == 4
     assert len(filtered) == 3
+
+
+# ── Test I: exact top_k guarantee ─────────────────────────────────────────────
+
+def test_I_exact_topk_fails_when_pool_too_small():
+    """retrieve_dinov2 must hard-fail (RuntimeError) if pool has fewer than top_n candidates."""
+    np = pytest.importorskip("numpy")
+    import retrieve_dinov2 as rd
+
+    rng = np.random.RandomState(1)
+    n_pool = 5   # smaller than top_n=10
+    n_hard = 2
+    dim = 4
+
+    pool_embs = rng.randn(n_pool, dim).astype(np.float32)
+    pool_embs /= np.linalg.norm(pool_embs, axis=1, keepdims=True)
+    hard_embs = rng.randn(n_hard, dim).astype(np.float32)
+    hard_embs /= np.linalg.norm(hard_embs, axis=1, keepdims=True)
+
+    pool_paths = [Path(f"/fake/p{i}.jpg") for i in range(n_pool)]
+    hard_paths = [Path(f"/fake/h{i}.jpg") for i in range(n_hard)]
+    hardness = {str(p.resolve()): 1.0 for p in hard_paths}
+    img_to_ds = {str(p.resolve()): "xwod" for p in hard_paths}
+
+    with pytest.raises(RuntimeError, match="EXACT-10 FAIL"):
+        rd.retrieve_dinov2(
+            hard_embs, hard_paths, hardness, img_to_ds,
+            pool_embs, pool_paths, sim_threshold=0.0, top_n=10
+        )
+
+
+def test_I_exact_topk_returns_exactly_topk():
+    """retrieve_dinov2 must return exactly top_n results when pool is large enough."""
+    np = pytest.importorskip("numpy")
+    import retrieve_dinov2 as rd
+
+    rng = np.random.RandomState(2)
+    n_pool = 50
+    n_hard = 3
+    dim = 8
+    top_n = 20
+
+    pool_embs = rng.randn(n_pool, dim).astype(np.float32)
+    pool_embs /= np.linalg.norm(pool_embs, axis=1, keepdims=True)
+    hard_embs = rng.randn(n_hard, dim).astype(np.float32)
+    hard_embs /= np.linalg.norm(hard_embs, axis=1, keepdims=True)
+
+    pool_paths = [Path(f"/fake/pool_{i:03d}.jpg") for i in range(n_pool)]
+    hard_paths = [Path(f"/fake/hard_{i}.jpg") for i in range(n_hard)]
+    hardness = {str(p.resolve()): 0.8 for p in hard_paths}
+    img_to_ds = {str(p.resolve()): "acdc" for p in hard_paths}
+
+    selected, stats = rd.retrieve_dinov2(
+        hard_embs, hard_paths, hardness, img_to_ds,
+        pool_embs, pool_paths, sim_threshold=0.999, top_n=top_n  # high threshold: diagnostic only
+    )
+
+    assert len(selected) == top_n, f"Expected exactly {top_n}, got {len(selected)}"
+    assert stats["selected_unique"] == top_n
+
+
+# ── Test J: retrieval_stats.json required similarity and provenance fields ─────
+
+def test_J_stats_have_sim_and_provenance_fields():
+    """retrieve_dinov2 stats dict must contain sim_all/sim_selected stats and provenance."""
+    np = pytest.importorskip("numpy")
+    import retrieve_dinov2 as rd
+
+    rng = np.random.RandomState(3)
+    n_pool = 15
+    n_hard = 2
+    dim = 6
+
+    pool_embs = rng.randn(n_pool, dim).astype(np.float32)
+    pool_embs /= np.linalg.norm(pool_embs, axis=1, keepdims=True)
+    hard_embs = rng.randn(n_hard, dim).astype(np.float32)
+    hard_embs /= np.linalg.norm(hard_embs, axis=1, keepdims=True)
+
+    pool_paths = [Path(f"/fake/p{i}.jpg") for i in range(n_pool)]
+    hard_paths_xwod = [Path(f"/fake/xwod/h0.jpg")]
+    hard_paths_acdc = [Path(f"/fake/acdc/h1.jpg")]
+    all_hard_paths = hard_paths_xwod + hard_paths_acdc
+    hardness = {str(p.resolve()): 0.9 for p in all_hard_paths}
+    img_to_ds = {
+        str(hard_paths_xwod[0].resolve()): "xwod",
+        str(hard_paths_acdc[0].resolve()): "acdc",
+    }
+
+    _, stats = rd.retrieve_dinov2(
+        hard_embs, all_hard_paths, hardness, img_to_ds,
+        pool_embs, pool_paths, sim_threshold=0.0, top_n=10
+    )
+
+    # All-pair similarity fields
+    for field in ["sim_all_min", "sim_all_median", "sim_all_mean", "sim_all_max"]:
+        assert field in stats, f"Missing field: {field}"
+        assert isinstance(stats[field], float), f"{field} must be float"
+
+    # Selected similarity fields
+    for field in ["sim_selected_min", "sim_selected_p05", "sim_selected_median",
+                  "sim_selected_p95", "sim_selected_max"]:
+        assert field in stats, f"Missing field: {field}"
+        assert isinstance(stats[field], float), f"{field} must be float"
+
+    # Ordering sanity
+    assert stats["sim_selected_min"] <= stats["sim_selected_median"] <= stats["sim_selected_max"]
+    assert stats["sim_all_min"] <= stats["sim_all_max"]
+
+    # Provenance fields
+    assert "unique_contributing_hard_queries" in stats
+    assert isinstance(stats["unique_contributing_hard_queries"], int)
+    assert stats["unique_contributing_hard_queries"] >= 1
+
+    assert "selected_by_query_dataset" in stats
+    ds_map = stats["selected_by_query_dataset"]
+    assert isinstance(ds_map, dict)
+    assert sum(ds_map.values()) == 10  # total selected
+
+    # threshold_is_diagnostic_only flag
+    assert stats.get("threshold_is_diagnostic_only") is True
+
+
+# ── Test K: dinov2_smoke_check raises on bad embedding ────────────────────────
+
+def test_K_smoke_check_raises_on_non_finite(tmp_path):
+    """dinov2_smoke_check must raise RuntimeError if embedding is non-finite."""
+    np = pytest.importorskip("numpy")
+    import retrieve_dinov2 as rd
+
+    # Mock the extraction function to return a NaN embedding
+    img = tmp_path / "fake.jpg"
+    img.write_bytes(b"x")
+
+    original_fn = rd.extract_dinov2_embeddings
+
+    def mock_extract(model, paths, batch_size, device, imgsz=224):
+        embs = np.array([[float("nan"), 1.0, 0.0]])
+        return embs, paths
+
+    rd.extract_dinov2_embeddings = mock_extract
+    try:
+        with pytest.raises(RuntimeError, match="DINO SMOKE"):
+            rd.dinov2_smoke_check(None, img, "cpu")
+    finally:
+        rd.extract_dinov2_embeddings = original_fn
+
+
+def test_K_smoke_check_raises_on_wrong_norm(tmp_path):
+    """dinov2_smoke_check must raise RuntimeError if L2 norm is not ≈ 1.0."""
+    np = pytest.importorskip("numpy")
+    import retrieve_dinov2 as rd
+
+    img = tmp_path / "fake.jpg"
+    img.write_bytes(b"x")
+
+    original_fn = rd.extract_dinov2_embeddings
+
+    def mock_extract(model, paths, batch_size, device, imgsz=224):
+        embs = np.array([[2.0, 3.0, 4.0]])  # norm ≠ 1
+        return embs, paths
+
+    rd.extract_dinov2_embeddings = mock_extract
+    try:
+        with pytest.raises(RuntimeError, match="DINO SMOKE"):
+            rd.dinov2_smoke_check(None, img, "cpu")
+    finally:
+        rd.extract_dinov2_embeddings = original_fn
+
+
+def test_K_smoke_check_passes_on_valid_embedding(tmp_path):
+    """dinov2_smoke_check must NOT raise when embedding is finite and L2-normalized."""
+    np = pytest.importorskip("numpy")
+    import retrieve_dinov2 as rd
+
+    img = tmp_path / "fake.jpg"
+    img.write_bytes(b"x")
+
+    original_fn = rd.extract_dinov2_embeddings
+
+    def mock_extract(model, paths, batch_size, device, imgsz=224):
+        emb = np.array([[1.0, 0.0, 0.0]])  # L2 norm = 1.0
+        return emb, paths
+
+    rd.extract_dinov2_embeddings = mock_extract
+    try:
+        rd.dinov2_smoke_check(None, img, "cpu")  # must not raise
+    finally:
+        rd.extract_dinov2_embeddings = original_fn

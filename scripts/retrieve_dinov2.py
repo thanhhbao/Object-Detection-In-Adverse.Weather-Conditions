@@ -6,8 +6,12 @@ Pipeline:
   1. RT-DETR checkpoint → find_hard_samples_gt_aware() → hard sample paths
   2. DINOv2 model → embed pool images → pool_embs [N, D]
   3. DINOv2 model → embed hard sample images → hard_embs [H, D]
-  4. Cosine similarity (DINOv2 is naturally isotropic — no centering needed)
-  5. Select top-K with sim >= threshold
+  4. For each pool candidate: max cosine similarity over ALL hard queries (no threshold filter)
+  5. Rank all pool candidates by that max score, select global top-K
+     --similarity-threshold is DIAGNOSTIC ONLY — it does not reduce the selected count
+
+Strict fairness guarantee: always outputs exactly --top-k unique images.
+If the rare-class-filtered pool has fewer than --top-k candidates, a hard error is raised.
 
 Class order (project): 0=person 1=bicycle 2=car 3=motorcycle 4=bus 5=truck
 Rare classes: 1=bicycle, 3=motorcycle, 4=bus
@@ -39,6 +43,7 @@ import os
 import random
 import shutil
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -111,7 +116,7 @@ def load_dinov2(model_name: str, device: str):
         model = torch.hub.load('facebookresearch/dinov2', model_name, verbose=False)
     except Exception:
         # Fallback: try transformers
-        from transformers import AutoModel, AutoImageProcessor  # type: ignore[import]
+        from transformers import AutoModel  # type: ignore[import]
         model = AutoModel.from_pretrained(f'facebook/{model_name}')
     model.eval()
     model.to(device)
@@ -151,7 +156,6 @@ def extract_dinov2_embeddings(
             img = cv2.resize(img, (imgsz, imgsz))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-            # Normalize with ImageNet stats
             for c in range(3):
                 t[c] = (t[c] - mean[c]) / std[c]
             tensors.append(t)
@@ -163,7 +167,6 @@ def extract_dinov2_embeddings(
         batch = torch.stack(tensors).to(device)
         with torch.no_grad():
             out = dinov2_model(batch)
-            # DINOv2 returns CLS token as first token or as a dict
             if isinstance(out, dict):
                 feat = out.get("last_hidden_state", out.get("pooler_output"))
                 if feat is not None and feat.ndim == 3:
@@ -174,7 +177,6 @@ def extract_dinov2_embeddings(
                 else:
                     feat = out
             else:
-                # torch.hub DINOv2 typically returns [B, D] directly via forward_features
                 try:
                     feat = dinov2_model.forward_features(batch)
                     if isinstance(feat, dict):
@@ -191,6 +193,30 @@ def extract_dinov2_embeddings(
     if not embs:
         return np.zeros((0, DINOV2_DIM.get("dinov2_vitb14", 768)), dtype=np.float32), []
     return np.vstack(embs), valid_paths
+
+
+# ── DINOv2 smoke check ─────────────────────────────────────────────────────────
+
+def dinov2_smoke_check(dinov2_model, sample_image_path: Path, device: str) -> None:
+    """
+    Embed one real image through DINOv2. Hard-fail if:
+      - image cannot be read
+      - embedding contains non-finite values
+      - L2 norm is not ≈ 1.0
+    """
+    print(f"  DINOv2 smoke check on {sample_image_path.name}...")
+    embs, valid = extract_dinov2_embeddings(
+        dinov2_model, [sample_image_path], batch_size=1, device=device
+    )
+    if len(valid) == 0:
+        raise RuntimeError(f"DINO SMOKE: failed to embed {sample_image_path}")
+    emb = embs[0]
+    if not np.all(np.isfinite(emb)):
+        raise RuntimeError("DINO SMOKE: embedding contains non-finite values (NaN or Inf)")
+    norm = float(np.linalg.norm(emb))
+    if abs(norm - 1.0) > 1e-3:
+        raise RuntimeError(f"DINO SMOKE: L2 norm = {norm:.6f}, expected ≈ 1.0")
+    print(f"  DINOv2 smoke check: PASS (dim={len(emb)}, norm={norm:.6f})")
 
 
 # ── Pool embedding cache (DINOv2-specific metadata) ───────────────────────────
@@ -235,47 +261,82 @@ def retrieve_dinov2(
     top_n: int,
 ) -> "tuple[list[dict], dict]":
     """
-    Cosine similarity retrieval using DINOv2 embeddings.
-    Both hard_embs and pool_embs are L2-normalized — dot product = cosine similarity.
-    No centering: DINOv2 is naturally isotropic.
+    Global top-N retrieval using DINOv2 cosine similarity.
+
+    Selection logic:
+      1. Compute [H, P] cosine similarity matrix (L2-normalized embeds → dot = cosine).
+      2. For each pool candidate p, score = max_h(sim[h, p]).
+      3. Rank ALL pool candidates by score descending; tie-break by pool filename.
+      4. Select the top_n candidates.
+
+    sim_threshold is DIAGNOSTIC ONLY — it does not gate or reduce the selected count.
+    If unique_pool_candidates < top_n, raises RuntimeError immediately.
     """
     sim_matrix = hard_embs @ pool_embs.T  # [H, P]
 
-    best_per_stem: dict = {}
-    candidate_hits_above_threshold = 0
+    # Per-pool-candidate: max cosine sim over all hard queries
+    max_sim_per_pool = sim_matrix.max(axis=0)   # [P]
+    argmax_per_pool = sim_matrix.argmax(axis=0)  # [P]
 
-    for h_idx, hard_path in enumerate(hard_paths):
-        canonical_key = str(hard_path.resolve())
-        sims = sim_matrix[h_idx]
-        order = np.argsort(-sims)
-        for p_idx in order:
-            score = float(sims[p_idx])
-            if score < sim_threshold:
-                break
-            candidate_hits_above_threshold += 1
-            p_path = pool_paths[p_idx]
-            stem = p_path.stem
-            if stem not in best_per_stem or best_per_stem[stem]["sim"] < score:
-                best_per_stem[stem] = {
-                    "pool_path": p_path,
-                    "sim": score,
-                    "query_path": hard_path,
-                    "query_dataset": img_to_dataset.get(canonical_key, ""),
-                    "hardness_score": hardness_scores.get(canonical_key, 0.0),
-                }
+    # Deduplicate by stem (pool should already be unique, but guard)
+    stem_to_entry: dict = {}
+    for p_idx, p_path in enumerate(pool_paths):
+        stem = p_path.stem
+        score = float(max_sim_per_pool[p_idx])
+        if stem not in stem_to_entry or stem_to_entry[stem]["sim"] < score:
+            h_idx = int(argmax_per_pool[p_idx])
+            hard_path = hard_paths[h_idx]
+            canonical_key = str(hard_path.resolve())
+            stem_to_entry[stem] = {
+                "pool_path": p_path,
+                "sim": score,
+                "query_path": hard_path,
+                "query_dataset": img_to_dataset.get(canonical_key, ""),
+                "hardness_score": hardness_scores.get(canonical_key, 0.0),
+            }
 
-    unique_before_topk = len(best_per_stem)
-    duplicate_removed = candidate_hits_above_threshold - unique_before_topk
+    unique_pool = len(stem_to_entry)
 
-    # Deterministic sort: (-sim, pool_name)
-    ranked = sorted(best_per_stem.values(), key=lambda x: (-x["sim"], x["pool_path"].name))
+    # Hard-fail immediately if pool is too small to guarantee exact top_n
+    if unique_pool < top_n:
+        raise RuntimeError(
+            f"EXACT-{top_n} FAIL: rare-class-filtered pool has only {unique_pool} unique candidates, "
+            f"need {top_n}. Check --pool-root and --candidate-target-classes."
+        )
+
+    # Threshold is diagnostic only: count candidates above threshold
+    hits_above_threshold = int(np.sum(max_sim_per_pool >= sim_threshold))
+
+    # Deterministic sort: highest sim first; tie-break by filename
+    ranked = sorted(stem_to_entry.values(), key=lambda x: (-x["sim"], x["pool_path"].name))
     selected = ranked[:top_n]
+    assert len(selected) == top_n  # invariant
+
+    # Similarity stats
+    all_sims = sim_matrix.flatten()
+    selected_sims = np.array([e["sim"] for e in selected], dtype=np.float64)
+    contributing_queries = {str(e["query_path"].resolve()) for e in selected if e["query_path"]}
+    ds_counter = Counter(e["query_dataset"] for e in selected)
 
     stats = {
-        "candidate_hits_above_threshold": candidate_hits_above_threshold,
-        "unique_candidates_before_top_k": unique_before_topk,
-        "duplicate_candidate_hits_removed": duplicate_removed,
+        "candidate_hits_above_threshold": hits_above_threshold,
+        "threshold_is_diagnostic_only": True,
+        "unique_candidates_before_top_k": unique_pool,
+        "duplicate_candidate_hits_removed": 0,  # dedup is by stem, not by hit count now
         "selected_unique": len(selected),
+        "unique_contributing_hard_queries": len(contributing_queries),
+        "selected_by_query_dataset": dict(ds_counter),
+        # All-pair similarity distribution
+        "sim_all_min": float(np.min(all_sims)),
+        "sim_all_median": float(np.median(all_sims)),
+        "sim_all_mean": float(np.mean(all_sims)),
+        "sim_all_max": float(np.max(all_sims)),
+        # Selected similarity distribution
+        "sim_selected_min": float(np.min(selected_sims)),
+        "sim_selected_p05": float(np.percentile(selected_sims, 5)),
+        "sim_selected_median": float(np.median(selected_sims)),
+        "sim_selected_p95": float(np.percentile(selected_sims, 95)),
+        "sim_selected_max": float(np.max(selected_sims)),
     }
     return selected, stats
 
@@ -284,7 +345,7 @@ def retrieve_dinov2(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="DINOv2 retrieval: RT-DETR hard mining + DINOv2 cosine similarity pool search"
+        description="DINOv2 retrieval: RT-DETR hard mining + global top-K cosine similarity"
     )
     p.add_argument("--weights", required=True, help="RT-DETR checkpoint for hard mining")
     p.add_argument("--pool-root", required=True, type=Path,
@@ -294,9 +355,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-root", required=True, type=Path, help="Output directory")
     p.add_argument("--dinov2-model", default="dinov2_vitb14", choices=DINOV2_CHOICES,
                    help="DINOv2 model variant (default: dinov2_vitb14)")
-    p.add_argument("--top-k", type=int, default=5000)
+    p.add_argument("--top-k", type=int, default=5000,
+                   help="Exact number of images to select (guaranteed; hard-fail if pool smaller)")
     p.add_argument("--similarity-threshold", type=float, default=0.70,
-                   help="Cosine similarity threshold (DINOv2 needs lower than RT-DETR centered, default: 0.70)")
+                   help="Cosine similarity threshold — DIAGNOSTIC ONLY, does not filter (default: 0.70)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--target-classes", nargs="+", type=int, default=[1, 3, 4],
                    help="Class IDs for hard mining (default: 1=bicycle 3=motorcycle 4=bus)")
@@ -354,12 +416,12 @@ def main() -> None:
     candidate_target_classes = set(candidate_target_classes_raw) if use_class_filter else None
 
     print(f"\n{'='*60}")
-    print("DINOv2 Retrieval (RT-DETR hard mining + DINOv2 cosine similarity)")
+    print("DINOv2 Retrieval (RT-DETR hard mining + global top-K cosine similarity)")
     print(f"  weights:              {args.weights}")
     print(f"  pool-root:            {pool_root}")
     print(f"  query-roots:          {[str(q) for q in args.query_roots]}")
-    print(f"  top-k:                {args.top_k}")
-    print(f"  similarity-threshold: {args.similarity_threshold}")
+    print(f"  top-k:                {args.top_k}  [guaranteed exact]")
+    print(f"  similarity-threshold: {args.similarity_threshold}  [diagnostic only]")
     print(f"  target:               {[CLASS_NAMES[c] for c in sorted(target_classes)]}")
     print(f"  match-iou:            {args.match_iou}")
     print(f"  seed:                 {args.seed}")
@@ -379,7 +441,7 @@ def main() -> None:
     pool_lbl_dir = pool_root / "labels" / "train"
     pool_paths = sorted(p for p in pool_img_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS)
     pool_count_before_filter = len(pool_paths)
-    print(f"[1/4] Pool size: {len(pool_paths)} images")
+    print(f"[1/5] Pool size: {len(pool_paths)} images")
 
     # Candidate class filter
     if use_class_filter and candidate_target_classes:
@@ -391,13 +453,38 @@ def main() -> None:
     pool_count_after_filter = len(pool_paths)
     print(f"Pool size (after class filter): {pool_count_after_filter}")
 
+    if pool_count_after_filter < args.top_k:
+        raise RuntimeError(
+            f"EXACT-{args.top_k} FAIL: rare-class-filtered pool has only "
+            f"{pool_count_after_filter} candidates, need {args.top_k}. "
+            "Check --pool-root and --candidate-target-classes."
+        )
+
+    # Load DINOv2 model BEFORE hard mining so smoke check uses a real XWOD image
+    print(f"\n[2/5] Loading DINOv2 ({dinov2_model_name})...")
+    dinov2 = load_dinov2(dinov2_model_name, device)
+
+    # DINOv2 smoke check: embed one real train image before any expensive work
+    smoke_img: Path | None = None
+    for qr in args.query_roots:
+        for p in sorted(qr.rglob("*")):
+            if p.suffix.lower() in IMAGE_EXTS and (p.is_file() or p.is_symlink()):
+                smoke_img = p
+                break
+        if smoke_img:
+            break
+    if smoke_img:
+        dinov2_smoke_check(dinov2, smoke_img, device)
+    else:
+        print("  WARNING: no real query image found for DINOv2 smoke check — skipping")
+
     # Load RT-DETR model for hard mining
-    print("[2/4] Loading RT-DETR checkpoint for hard mining...")
+    print("\n[3/5] Loading RT-DETR checkpoint for hard mining...")
     model = YOLO(str(args.weights))
     model.to(device)
 
     # Hard mining
-    print("\n[3/4] GT-aware hard mining from query dirs...")
+    print("\n[4/5] GT-aware hard mining from query dirs...")
     all_hard_imgs: list = []
     all_hardness: dict = {}
     all_img_to_dataset: dict = {}
@@ -440,13 +527,10 @@ def main() -> None:
     print(f"  Total hard samples across all query dirs: {len(all_hard_imgs)}")
     print(f"Hard samples found: {len(all_hard_imgs)}")
 
-    # Load DINOv2 model for embeddings
-    print(f"\n[4/4] Loading DINOv2 ({dinov2_model_name}) and extracting embeddings...")
-    dinov2 = load_dinov2(dinov2_model_name, device)
-
-    # Pool embeddings (with cache)
-    cache_path = args.cache_pool_embs
+    # Pool and hard sample embeddings
+    print(f"\n[5/5] Extracting DINOv2 embeddings...")
     pool_embs = None
+    cache_path = args.cache_pool_embs
     if cache_path:
         expected_meta = _dinov2_cache_meta(args.weights, dinov2_model_name, pool_paths)
         cached = load_pool_cache(cache_path, expected_meta)
@@ -462,18 +546,16 @@ def main() -> None:
             expected_meta = _dinov2_cache_meta(args.weights, dinov2_model_name, pool_paths)
             save_pool_cache(cache_path, pool_embs, pool_paths, expected_meta)
 
-    # Determine actual embedding dim
     if pool_embs is not None and pool_embs.ndim == 2 and pool_embs.shape[0] > 0:
         embedding_dim = pool_embs.shape[1]
 
-    # Hard sample embeddings
     print("  Extracting DINOv2 hard sample embeddings...")
     hard_embs, all_hard_imgs = extract_dinov2_embeddings(
         dinov2, all_hard_imgs, batch_size=args.batch_size, device=device
     )
 
-    # Retrieval
-    print(f"  Retrieving (sim >= {args.similarity_threshold}, top-{args.top_k})...")
+    # Retrieval: global top-K by max cosine sim; threshold diagnostic only
+    print(f"  Retrieving global top-{args.top_k} (threshold={args.similarity_threshold} is diagnostic only)...")
     selected, ret_stats = retrieve_dinov2(
         hard_embs=hard_embs,
         hard_paths=all_hard_imgs,
@@ -484,10 +566,17 @@ def main() -> None:
         sim_threshold=args.similarity_threshold,
         top_n=args.top_k,
     )
-    print(f"  Candidate hits above threshold: {ret_stats['candidate_hits_above_threshold']}")
-    print(f"  Unique candidates (before top-k): {ret_stats['unique_candidates_before_top_k']}")
-    print(f"  Duplicates removed: {ret_stats['duplicate_candidate_hits_removed']}")
+    print(f"  Unique pool candidates: {ret_stats['unique_candidates_before_top_k']}")
+    print(f"  Candidates above threshold (diagnostic): {ret_stats['candidate_hits_above_threshold']}")
+    print(f"  Unique contributing hard queries: {ret_stats['unique_contributing_hard_queries']}")
     print(f"  Selected unique: {ret_stats['selected_unique']}")
+    print(f"  Selected similarity: "
+          f"min={ret_stats['sim_selected_min']:.4f} "
+          f"p05={ret_stats['sim_selected_p05']:.4f} "
+          f"median={ret_stats['sim_selected_median']:.4f} "
+          f"p95={ret_stats['sim_selected_p95']:.4f} "
+          f"max={ret_stats['sim_selected_max']:.4f}")
+    print(f"  Provenance: {ret_stats['selected_by_query_dataset']}")
 
     # Leakage check
     if args.used_bdd_root:
@@ -510,7 +599,8 @@ def main() -> None:
         overlap_count = -1  # not checked
 
     # Hard invariants
-    assert ret_stats["selected_unique"] <= args.top_k, "selected_unique > top_k — invariant violated"
+    assert ret_stats["selected_unique"] == args.top_k, \
+        f"selected_unique={ret_stats['selected_unique']} != top_k={args.top_k} — invariant violated"
     retrieved_basenames = [entry["pool_path"].name for entry in selected]
     assert len(retrieved_basenames) == len(set(retrieved_basenames)), "duplicate retrieved image names"
 
@@ -541,7 +631,7 @@ def main() -> None:
             "similarity": f"{sim:.6f}",
             "hardness_score": f"{hardness:.6f}" if isinstance(hardness, float) else "",
             "rank": rank,
-            "selected_reason": "dinov2_cosine_retrieval",
+            "selected_reason": "dinov2_cosine_global_topk",
         })
 
     # dataset.yaml
@@ -593,14 +683,16 @@ def main() -> None:
     # Label validation
     violations = validate_labels(out_lbl_dir, max_class_id=5)
     if violations:
-        raise RuntimeError(f"Label validation failed:\n" + "\n".join(violations[:10]))
+        raise RuntimeError("Label validation failed:\n" + "\n".join(violations[:10]))
 
     # retrieval_stats.json
     stats = {
-        "retrieval_method": "dinov2_cosine",
+        "retrieval_method": "dinov2_cosine_global_topk",
         "dinov2_model": dinov2_model_name,
         "embedding_dim": embedding_dim,
         "centering_applied": False,
+        "threshold_is_diagnostic_only": True,
+        "similarity_threshold_diagnostic": args.similarity_threshold,
         "candidate_pool_size": pool_count_after_filter,
         "candidate_pool_before_class_filter": pool_count_before_filter,
         "candidate_pool_after_class_filter": pool_count_after_filter,
@@ -610,12 +702,21 @@ def main() -> None:
         "hard_query_count": len(all_hard_imgs),
         "requested_top_k": args.top_k,
         "selected_unique": selected_unique,
-        "similarity_threshold": args.similarity_threshold,
         "seed": args.seed,
         "candidate_hits_above_threshold": ret_stats["candidate_hits_above_threshold"],
         "unique_candidates_before_top_k": ret_stats["unique_candidates_before_top_k"],
         "duplicate_candidate_hits_removed": ret_stats["duplicate_candidate_hits_removed"],
-        "duplicate_candidates_removed": ret_stats["duplicate_candidate_hits_removed"],
+        "unique_contributing_hard_queries": ret_stats["unique_contributing_hard_queries"],
+        "selected_by_query_dataset": ret_stats["selected_by_query_dataset"],
+        "sim_all_min": ret_stats["sim_all_min"],
+        "sim_all_median": ret_stats["sim_all_median"],
+        "sim_all_mean": ret_stats["sim_all_mean"],
+        "sim_all_max": ret_stats["sim_all_max"],
+        "sim_selected_min": ret_stats["sim_selected_min"],
+        "sim_selected_p05": ret_stats["sim_selected_p05"],
+        "sim_selected_median": ret_stats["sim_selected_median"],
+        "sim_selected_p95": ret_stats["sim_selected_p95"],
+        "sim_selected_max": ret_stats["sim_selected_max"],
         "overlap_with_used_bdd": overlap_count,
         "source_split_counts": {"bdd_train": selected_unique},
         "output_image_count": output_img_count,
@@ -627,7 +728,7 @@ def main() -> None:
     )
 
     print(f"\nDone. DINOv2 retrieved data → {out_root}")
-    print(f"  selected_unique: {selected_unique}")
+    print(f"  selected_unique: {selected_unique}  (exactly top_k={args.top_k})")
     print(f"  dinov2_model: {dinov2_model_name}  dim: {embedding_dim}")
     print(f"  source_split: all bdd_train")
 

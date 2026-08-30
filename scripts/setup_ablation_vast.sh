@@ -100,20 +100,21 @@ python "${REPO}/scripts/build_phase2_dataset.py" \
   --out-root "${A1_DINO_MERGED}" \
   --bdd-use-all --seed 42 --mode symlink --oversample-rare --clean
 
-# Step 6: Audit
+# Step 6: Audit — hard-fail unless each arm has exactly 5000 images/labels/manifest and zero overlap
 echo ""
-echo "Step 6: Audit all ablation arms..."
+echo "Step 6: Audit all ablation arms (exact-5000 + zero-overlap enforcement)..."
 python3 -c "
 import json, sys
-from pathlib import Path
+
+REQUIRED_COUNT = 5000
 
 arms = {
-  'A0R':    ('${RANDOM_RARE_ROOT}/random_rare_stats.json', '${A0R_MERGED}'),
-  'A1-DINO': ('${DINO_RETRIEVED_ROOT}/retrieval_stats.json', '${A1_DINO_MERGED}'),
+  'A0R':     '${RANDOM_RARE_ROOT}/random_rare_stats.json',
+  'A1-DINO': '${DINO_RETRIEVED_ROOT}/retrieval_stats.json',
 }
 
-ok = True
-for arm, (stats_path, merged_path) in arms.items():
+errors = []
+for arm, stats_path in arms.items():
     try:
         d = json.load(open(stats_path))
         sel = d.get('selected', d.get('selected_unique', '?'))
@@ -122,20 +123,30 @@ for arm, (stats_path, merged_path) in arms.items():
         man_c = d.get('manifest_row_count', '?')
         ovl   = d.get('overlap_with_used_bdd', '?')
         print(f'  {arm}: selected={sel}  images={img_c}  labels={lbl_c}  manifest={man_c}  overlap_bdd={ovl}')
-        if ovl not in (0, '?'):
-            print(f'  ERROR: {arm} has overlap_with_used_bdd={ovl}')
-            ok = False
-        if img_c != lbl_c or img_c != man_c:
-            print(f'  ERROR: {arm} count mismatch')
-            ok = False
-    except Exception as e:
-        print(f'  ERROR reading {arm} stats: {e}')
-        ok = False
 
-if not ok:
+        # Exact count check
+        for field, val in [('output_image_count', img_c), ('output_label_count', lbl_c), ('manifest_row_count', man_c)]:
+            if val != REQUIRED_COUNT:
+                errors.append(f'{arm}: {field}={val}, expected {REQUIRED_COUNT}')
+
+        # Zero overlap check
+        if ovl != 0:
+            errors.append(f'{arm}: overlap_with_used_bdd={ovl}, expected 0')
+
+        # Cross-arm count parity is enforced by both being REQUIRED_COUNT
+
+    except Exception as e:
+        errors.append(f'{arm}: failed to read stats — {e}')
+
+if errors:
+    print()
+    print('AUDIT FAILED:')
+    for e in errors:
+        print(f'  ERROR: {e}')
     sys.exit(1)
+
 print()
-print('Audit: PASS')
+print('Audit: PASS — both arms have exactly 5000 images/labels/manifest rows, zero overlap with used BDD.')
 "
 
 echo ""
