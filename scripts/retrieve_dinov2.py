@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-DINOv2-based retrieval: RT-DETR hard mining + DINOv2 cosine similarity pool search.
+DINOv2-based retrieval: RT-DETR hard mining + crop-level DINOv2 + per-class quota.
 
-Pipeline:
+Default pipeline (--use-quota, the default):
   1. RT-DETR checkpoint → find_hard_samples_gt_aware() → hard sample paths
-  2. DINOv2 model → embed pool images → pool_embs [N, D]
-  3. DINOv2 model → embed hard sample images → hard_embs [H, D]
-  4. For each pool candidate: max cosine similarity over ALL hard queries (no threshold filter)
-  5. Rank all pool candidates by that max score, select global top-K
-     --similarity-threshold is DIAGNOSTIC ONLY — it does not reduce the selected count
+  2. DINOv2 → embed POOL whole images → pool_embs [N, D]
+  3. DINOv2 → embed GT OBJECT CROPS from hard samples → crop_embs [Nc, D]
+     ACDC hard samples are duplicated (--acdc-query-weight) to boost adverse-domain pull.
+  4. Per-pool score = max_crop_sim × (rare_ratio ^ alpha)  (rare_ratio from GT labels)
+  5. Per-class quota fill: bicycle=2000, motorcycle=2000, bus=1000 → deduplicated → fill to top-k
 
-Strict fairness guarantee: always outputs exactly --top-k unique images.
-If the rare-class-filtered pool has fewer than --top-k candidates, a hard error is raised.
+Legacy pipeline (--no-quota):
+  whole-image hard-sample embedding + global top-K (original behaviour)
+
+Strict fairness: always outputs exactly --top-k unique images or raises RuntimeError.
 
 Class order (project): 0=person 1=bicycle 2=car 3=motorcycle 4=bus 5=truck
 Rare classes: 1=bicycle, 3=motorcycle, 4=bus
@@ -253,6 +255,144 @@ def extract_dinov2_embeddings(
     return np.vstack(embs), valid_paths
 
 
+# ── Pool rare-class statistics ────────────────────────────────────────────────
+
+def compute_pool_rare_stats(
+    pool_paths: list,
+    pool_lbl_dir: "Path",
+    rare_classes: set,
+) -> dict:
+    """
+    For each pool image, compute rare-class statistics from its label file.
+    Returns dict keyed by image stem:
+      rare_count, total_count, rare_ratio, class_ids (set of int).
+    """
+    stats: dict = {}
+    for img_path in pool_paths:
+        lbl = pool_lbl_dir / f"{img_path.stem}.txt"
+        total, rare = 0, 0
+        class_ids: set = set()
+        if lbl.exists():
+            for line in lbl.read_text(encoding="utf-8").strip().splitlines():
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                cls_id = int(parts[0])
+                class_ids.add(cls_id)
+                total += 1
+                if cls_id in rare_classes:
+                    rare += 1
+        stats[img_path.stem] = {
+            "rare_count": rare,
+            "total_count": total,
+            "rare_ratio": rare / total if total > 0 else 0.0,
+            "class_ids": class_ids,
+        }
+    return stats
+
+
+# ── Crop-level query embedding ─────────────────────────────────────────────────
+
+def extract_crop_embeddings(
+    dinov2_model,
+    hard_imgs: list,
+    query_lbl_dirs: dict,
+    img_to_dataset: dict,
+    target_classes: set,
+    batch_size: int,
+    device: str,
+    padding: float = 0.10,
+    imgsz: int = 224,
+    acdc_weight: int = 2,
+) -> "tuple[np.ndarray, list, list, list]":
+    """
+    Extract DINOv2 embeddings for GT object crops from hard samples.
+
+    Each target-class bounding box is cropped (+ padding) and embedded.
+    ACDC-sourced images are duplicated acdc_weight times so they pull
+    more of the retrieval budget toward adverse-condition exemplars.
+
+    Returns (crop_embs [N,D], crop_srcs [N], crop_classes [N], crop_datasets [N]).
+    """
+    import cv2  # type: ignore[import]
+    mean = [0.485, 0.456, 0.406]
+    std  = [0.229, 0.224, 0.225]
+
+    crop_tensors: list = []
+    crop_srcs:    list = []
+    crop_cls_list: list = []
+    crop_ds_list:  list = []
+
+    def _add_image(img_path: "Path") -> None:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            return
+        h, w = img.shape[:2]
+        lbl_dir = query_lbl_dirs.get(img_path.stem)
+        if lbl_dir is None:
+            return
+        lbl = lbl_dir / f"{img_path.stem}.txt"
+        if not lbl.exists():
+            return
+        canonical = str(img_path.resolve())
+        ds = img_to_dataset.get(canonical, "")
+        for line in lbl.read_text(encoding="utf-8").strip().splitlines():
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            cls_id = int(parts[0])
+            if cls_id not in target_classes:
+                continue
+            cx, cy, bw, bh = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+            x1 = int((cx - bw / 2 - padding * bw) * w)
+            y1 = int((cy - bh / 2 - padding * bh) * h)
+            x2 = int((cx + bw / 2 + padding * bw) * w)
+            y2 = int((cy + bh / 2 + padding * bh) * h)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = img[y1:y2, x1:x2]
+            crop_r = cv2.resize(crop, (imgsz, imgsz))
+            crop_rgb = cv2.cvtColor(crop_r, cv2.COLOR_BGR2RGB)
+            t = torch.from_numpy(crop_rgb).permute(2, 0, 1).float() / 255.0
+            for c in range(3):
+                t[c] = (t[c] - mean[c]) / std[c]
+            crop_tensors.append(t)
+            crop_srcs.append(img_path)
+            crop_cls_list.append(cls_id)
+            crop_ds_list.append(ds)
+
+    for img_path in hard_imgs:
+        canonical = str(img_path.resolve())
+        ds = img_to_dataset.get(canonical, "")
+        _add_image(img_path)
+        if ds == "acdc":
+            for _ in range(acdc_weight - 1):
+                _add_image(img_path)
+
+    if not crop_tensors:
+        return np.zeros((0, 768), dtype=np.float32), [], [], []
+
+    embs = []
+    for i in tqdm(range(0, len(crop_tensors), batch_size), desc="  DINOv2 crop embed", ncols=80):
+        batch = torch.stack(crop_tensors[i: i + batch_size]).to(device)
+        with torch.no_grad():
+            out = dinov2_model(batch)
+            if isinstance(out, dict):
+                feat = out.get("last_hidden_state", out.get("pooler_output"))
+                if feat is not None and feat.ndim == 3:
+                    feat = feat[:, 0]
+            elif isinstance(out, torch.Tensor):
+                feat = out[:, 0] if out.ndim == 3 else out
+            else:
+                feat = out
+        feat = F.normalize(feat.float(), dim=1)
+        embs.append(feat.cpu().numpy())
+
+    return np.vstack(embs), crop_srcs, crop_cls_list, crop_ds_list
+
+
 # ── DINOv2 smoke check ─────────────────────────────────────────────────────────
 
 def dinov2_smoke_check(dinov2_model, sample_image_path: Path, device: str) -> None:
@@ -399,6 +539,135 @@ def retrieve_dinov2(
     return selected, stats
 
 
+# ── Per-class quota retrieval with rare-density scoring ───────────────────────
+
+def retrieve_dinov2_quota(
+    crop_embs: "np.ndarray",
+    crop_srcs: list,
+    crop_datasets: list,
+    pool_embs: "np.ndarray",
+    pool_paths: list,
+    pool_rare_stats: dict,
+    class_quotas: dict,
+    total_k: int,
+    rare_density_alpha: float,
+    sim_threshold: float,
+    img_to_dataset: dict,
+    rng: "random.Random",
+) -> "tuple[list[dict], dict]":
+    """
+    Per-class quota retrieval with rare-density scoring.
+
+    Score formula: final_score = max_crop_sim × (rare_ratio ^ alpha)
+    If rare_ratio == 0 the candidate still participates (score ≈ sim × epsilon).
+
+    Quota fill order:
+      1. For each class (sorted by ascending quota), pick top candidates that
+         contain that class and have not yet been selected.
+      2. Fill any shortfall with the globally highest-score unselected candidates.
+
+    Guarantees exactly total_k unique images or raises RuntimeError.
+    """
+    # [Nc, P] cosine similarity (already L2-normalised → dot = cosine)
+    sim_matrix = crop_embs @ pool_embs.T
+    max_sim_per_pool = sim_matrix.max(axis=0)    # [P]
+    argmax_per_pool  = sim_matrix.argmax(axis=0) # [P]
+
+    # Build per-pool entry with final_score
+    pool_entries: dict = {}
+    for p_idx, p_path in enumerate(pool_paths):
+        stem = p_path.stem
+        sim = float(max_sim_per_pool[p_idx])
+        s = pool_rare_stats.get(stem, {"rare_count": 0, "total_count": 0,
+                                       "rare_ratio": 0.0, "class_ids": set()})
+        rr = s["rare_ratio"]
+        final_score = sim * (rr ** rare_density_alpha) if rr > 0 else sim * 1e-3
+        c_src = crop_srcs[int(argmax_per_pool[p_idx])]
+        canonical = str(c_src.resolve())
+        ds = img_to_dataset.get(canonical, crop_datasets[int(argmax_per_pool[p_idx])])
+        if stem not in pool_entries or pool_entries[stem]["final_score"] < final_score:
+            pool_entries[stem] = {
+                "pool_path": p_path,
+                "sim": sim,
+                "final_score": final_score,
+                "rare_ratio": rr,
+                "rare_count": s["rare_count"],
+                "class_ids": s["class_ids"],
+                "query_path": c_src,
+                "query_dataset": ds,
+                "hardness_score": 0.0,
+            }
+
+    unique_pool = len(pool_entries)
+    if unique_pool < total_k:
+        raise RuntimeError(
+            f"EXACT-{total_k} FAIL: rare-class pool has only {unique_pool} unique "
+            f"candidates, need {total_k}. Check --pool-root and --candidate-target-classes."
+        )
+
+    selected_stems: set = set()
+    selected: list = []
+
+    # Quota fill: process classes from smallest quota first to avoid starvation
+    for cls_id in sorted(class_quotas, key=lambda c: class_quotas[c]):
+        quota = class_quotas[cls_id]
+        candidates = [
+            entry for stem, entry in pool_entries.items()
+            if stem not in selected_stems and cls_id in entry["class_ids"]
+        ]
+        candidates.sort(key=lambda x: (-x["final_score"], x["pool_path"].name))
+        for entry in candidates[:quota]:
+            selected_stems.add(entry["pool_path"].stem)
+            selected.append({**entry, "selected_reason": f"quota_cls{cls_id}"})
+
+    # Global fill to reach total_k
+    if len(selected) < total_k:
+        remaining = [
+            entry for stem, entry in pool_entries.items()
+            if stem not in selected_stems
+        ]
+        remaining.sort(key=lambda x: (-x["final_score"], x["pool_path"].name))
+        for entry in remaining[:total_k - len(selected)]:
+            selected_stems.add(entry["pool_path"].stem)
+            selected.append({**entry, "selected_reason": "score_fill"})
+
+    if len(selected) < total_k:
+        raise RuntimeError(
+            f"EXACT-{total_k} FAIL: only {len(selected)} after quota+fill. "
+            "Expand pool or lower quotas."
+        )
+    selected = selected[:total_k]
+    assert len(selected) == total_k
+
+    sel_sims = np.array([e["sim"] for e in selected], dtype=np.float64)
+    ds_counter = Counter(e["query_dataset"] for e in selected)
+    reason_counter = Counter(e["selected_reason"] for e in selected)
+    hits = int(np.sum(max_sim_per_pool >= sim_threshold))
+
+    stats_out = {
+        "candidate_hits_above_threshold": hits,
+        "threshold_is_diagnostic_only": True,
+        "unique_candidates_before_top_k": unique_pool,
+        "duplicate_candidate_hits_removed": 0,
+        "selected_unique": len(selected),
+        "unique_contributing_hard_queries": len(
+            {str(e["query_path"].resolve()) for e in selected if e["query_path"]}
+        ),
+        "selected_by_query_dataset": dict(ds_counter),
+        "selected_by_reason": dict(reason_counter),
+        "sim_all_min": float(np.min(max_sim_per_pool)),
+        "sim_all_median": float(np.median(max_sim_per_pool)),
+        "sim_all_mean": float(np.mean(max_sim_per_pool)),
+        "sim_all_max": float(np.max(max_sim_per_pool)),
+        "sim_selected_min": float(np.min(sel_sims)),
+        "sim_selected_p05": float(np.percentile(sel_sims, 5)),
+        "sim_selected_median": float(np.median(sel_sims)),
+        "sim_selected_p95": float(np.percentile(sel_sims, 95)),
+        "sim_selected_max": float(np.max(sel_sims)),
+    }
+    return selected, stats_out
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
@@ -433,6 +702,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["symlink", "copy"], default="symlink")
     p.add_argument("--clean", action="store_true",
                    help="Remove --out-root before writing. Without it, fail if non-empty.")
+    # ── Quota / rare-density options ──────────────────────────────────────
+    p.add_argument("--rare-density-alpha", type=float, default=0.5,
+                   help="Exponent for rare_ratio in final_score = sim × rare_ratio^alpha (default: 0.5)")
+    p.add_argument("--acdc-query-weight", type=int, default=2,
+                   help="Repeat ACDC crops this many times in query set (default: 2)")
+    p.add_argument("--quota-bicycle", type=int, default=2000)
+    p.add_argument("--quota-motorcycle", type=int, default=2000)
+    p.add_argument("--quota-bus", type=int, default=1000)
+    p.add_argument("--use-quota", action="store_true", default=True,
+                   help="Use per-class quota + rare-density scoring (default: True)")
+    p.add_argument("--no-quota", dest="use_quota", action="store_false",
+                   help="Fall back to global top-K without quota or density scoring")
     return p.parse_args()
 
 
@@ -546,6 +827,7 @@ def main() -> None:
     all_hard_imgs: list = []
     all_hardness: dict = {}
     all_img_to_dataset: dict = {}
+    query_lbl_dirs: dict = {}  # stem -> Path  (used for crop embedding)
     query_count = 0
 
     for query_root_path in args.query_roots:
@@ -570,6 +852,8 @@ def main() -> None:
                 conf_hard=args.conf_hard, match_iou=args.match_iou,
                 query_dataset=query_dataset,
             )
+            for p in hard_imgs:
+                query_lbl_dirs[p.stem] = lbl_dir
         else:
             print(f"  WARNING: No label dir found for {query_root_path} — skipping GT-aware mining.")
             hard_imgs, hardness, img_to_ds = [], {}, {}
@@ -585,7 +869,7 @@ def main() -> None:
     print(f"  Total hard samples across all query dirs: {len(all_hard_imgs)}")
     print(f"Hard samples found: {len(all_hard_imgs)}")
 
-    # Pool and hard sample embeddings
+    # Pool and query embeddings
     print(f"\n[5/5] Extracting DINOv2 embeddings...")
     pool_embs = None
     cache_path = args.cache_pool_embs
@@ -596,7 +880,7 @@ def main() -> None:
             pool_embs, pool_paths = cached
 
     if pool_embs is None:
-        print("  Extracting DINOv2 pool embeddings...")
+        print("  Extracting DINOv2 pool embeddings (whole-image)...")
         pool_embs, pool_paths = extract_dinov2_embeddings(
             dinov2, pool_paths, batch_size=args.batch_size, device=device
         )
@@ -607,23 +891,73 @@ def main() -> None:
     if pool_embs is not None and pool_embs.ndim == 2 and pool_embs.shape[0] > 0:
         embedding_dim = pool_embs.shape[1]
 
-    print("  Extracting DINOv2 hard sample embeddings...")
-    hard_embs, all_hard_imgs = extract_dinov2_embeddings(
-        dinov2, all_hard_imgs, batch_size=args.batch_size, device=device
-    )
+    if args.use_quota:
+        # ── NEW: crop-level queries + rare-density + per-class quota ──────
+        print(f"  Mode: crop-level query embedding + rare-density scoring + per-class quota")
+        print(f"  Extracting DINOv2 crop embeddings (acdc_weight={args.acdc_query_weight})...")
+        crop_embs, crop_srcs, crop_cls_list, crop_ds_list = extract_crop_embeddings(
+            dinov2, all_hard_imgs, query_lbl_dirs, all_img_to_dataset,
+            target_classes, args.batch_size, device,
+            acdc_weight=args.acdc_query_weight,
+        )
+        if crop_embs.shape[0] == 0:
+            raise RuntimeError(
+                "No crop embeddings extracted — no GT boxes for target classes found in hard samples. "
+                "Check --target-classes and query label dirs."
+            )
+        print(f"  Crop embeddings: {crop_embs.shape[0]} crops from {len(all_hard_imgs)} hard images")
 
-    # Retrieval: global top-K by max cosine sim; threshold diagnostic only
-    print(f"  Retrieving global top-{args.top_k} (threshold={args.similarity_threshold} is diagnostic only)...")
-    selected, ret_stats = retrieve_dinov2(
-        hard_embs=hard_embs,
-        hard_paths=all_hard_imgs,
-        hardness_scores=all_hardness,
-        img_to_dataset=all_img_to_dataset,
-        pool_embs=pool_embs,
-        pool_paths=pool_paths,
-        sim_threshold=args.similarity_threshold,
-        top_n=args.top_k,
-    )
+        # Pool rare stats (needed for density scoring and quota)
+        print("  Computing pool rare-class statistics...")
+        pool_rare_stats = compute_pool_rare_stats(
+            pool_paths, pool_lbl_dir, set(args.target_classes)
+        )
+        rare_multi = sum(
+            1 for s in pool_rare_stats.values()
+            if s["rare_count"] >= 2 or s["rare_ratio"] >= 0.3
+        )
+        print(f"  Pool images with rare_count≥2 or rare_ratio≥0.3: {rare_multi}/{len(pool_paths)}")
+
+        class_quotas = {
+            1: args.quota_bicycle,
+            3: args.quota_motorcycle,
+            4: args.quota_bus,
+        }
+        print(f"  Class quotas: bicycle={class_quotas[1]} motorcycle={class_quotas[3]} bus={class_quotas[4]}")
+        print(f"  Rare-density alpha: {args.rare_density_alpha}")
+
+        selected, ret_stats = retrieve_dinov2_quota(
+            crop_embs=crop_embs,
+            crop_srcs=crop_srcs,
+            crop_datasets=crop_ds_list,
+            pool_embs=pool_embs,
+            pool_paths=pool_paths,
+            pool_rare_stats=pool_rare_stats,
+            class_quotas=class_quotas,
+            total_k=args.top_k,
+            rare_density_alpha=args.rare_density_alpha,
+            sim_threshold=args.similarity_threshold,
+            img_to_dataset=all_img_to_dataset,
+            rng=random.Random(args.seed),
+        )
+        print(f"  Selected by reason: {ret_stats['selected_by_reason']}")
+    else:
+        # ── Legacy: whole-image queries + global top-K ──────────────────
+        print("  Mode: whole-image query embedding + global top-K (legacy, --no-quota)")
+        hard_embs, all_hard_imgs = extract_dinov2_embeddings(
+            dinov2, all_hard_imgs, batch_size=args.batch_size, device=device
+        )
+        selected, ret_stats = retrieve_dinov2(
+            hard_embs=hard_embs,
+            hard_paths=all_hard_imgs,
+            hardness_scores=all_hardness,
+            img_to_dataset=all_img_to_dataset,
+            pool_embs=pool_embs,
+            pool_paths=pool_paths,
+            sim_threshold=args.similarity_threshold,
+            top_n=args.top_k,
+        )
+
     print(f"  Unique pool candidates: {ret_stats['unique_candidates_before_top_k']}")
     print(f"  Candidates above threshold (diagnostic): {ret_stats['candidate_hits_above_threshold']}")
     print(f"  Unique contributing hard queries: {ret_stats['unique_contributing_hard_queries']}")
@@ -674,7 +1008,8 @@ def main() -> None:
         sim = entry["sim"]
         query_path = entry["query_path"]
         query_dataset = entry["query_dataset"]
-        hardness = entry["hardness_score"]
+        hardness = entry.get("hardness_score", 0.0)
+        sel_reason = entry.get("selected_reason", "dinov2_cosine_global_topk")
         lbl_path = pool_lbl_dir / f"{img_path.stem}.txt"
         place_file(img_path, out_img_dir / img_path.name, args.mode)
         if lbl_path.exists():
@@ -687,9 +1022,9 @@ def main() -> None:
             "query_image": str(query_path) if query_path else "",
             "query_dataset": query_dataset,
             "similarity": f"{sim:.6f}",
-            "hardness_score": f"{hardness:.6f}" if isinstance(hardness, float) else "",
+            "hardness_score": f"{hardness:.6f}" if isinstance(hardness, (int, float)) else "",
             "rank": rank,
-            "selected_reason": "dinov2_cosine_global_topk",
+            "selected_reason": sel_reason,
         })
 
     # dataset.yaml
@@ -745,7 +1080,12 @@ def main() -> None:
 
     # retrieval_stats.json
     stats = {
-        "retrieval_method": "dinov2_cosine_global_topk",
+        "retrieval_method": "dinov2_crop_quota_rare_density" if args.use_quota else "dinov2_cosine_global_topk",
+        "use_quota": args.use_quota,
+        "rare_density_alpha": args.rare_density_alpha if args.use_quota else None,
+        "acdc_query_weight": args.acdc_query_weight if args.use_quota else None,
+        "class_quotas": {"1_bicycle": args.quota_bicycle, "3_motorcycle": args.quota_motorcycle,
+                         "4_bus": args.quota_bus} if args.use_quota else None,
         "dinov2_model": dinov2_model_name,
         "embedding_dim": embedding_dim,
         "centering_applied": False,
@@ -766,6 +1106,7 @@ def main() -> None:
         "duplicate_candidate_hits_removed": ret_stats["duplicate_candidate_hits_removed"],
         "unique_contributing_hard_queries": ret_stats["unique_contributing_hard_queries"],
         "selected_by_query_dataset": ret_stats["selected_by_query_dataset"],
+        "selected_by_reason": ret_stats.get("selected_by_reason", {}),
         "sim_all_min": ret_stats["sim_all_min"],
         "sim_all_median": ret_stats["sim_all_median"],
         "sim_all_mean": ret_stats["sim_all_mean"],
