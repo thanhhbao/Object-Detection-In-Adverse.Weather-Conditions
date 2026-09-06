@@ -3,20 +3,19 @@
 Active learning retrieval: hard sample mining → cosine similarity → pool expansion.
 
 Pipeline:
-  1. Load YOLO checkpoint, build embedding index for all pool images (BDD remaining pool)
-  2. Run inference on query images (TRAINING DATA ONLY — caller is responsible for
-     passing only train-split directories), find images where model fails on target classes
-  3. Extract embeddings for hard samples
+  1. Load YOLO/RT-DETR checkpoint, build embedding index for all pool images
+  2. Run GT-aware hard mining on query images (TRAINING DATA ONLY)
+  3. Extract multi-scale embeddings for hard samples
   4. Cosine similarity: hard_embs @ pool_embs.T
   5. Select pool images with sim >= threshold → output dir for retraining
 
 WARNING: --query-root must point to TRAIN-split directories only. Using val or test
-splits would constitute a data-leakage violation for this experiment. The CLI enforces
-no path check — the caller is responsible.
+splits would constitute a data-leakage violation. The CLI enforces this via
+validate_query_root().
 
 Class order (project): 0=person 1=bicycle 2=car 3=motorcycle 4=bus 5=truck
 
-New CLI usage (P2-A1):
+New CLI usage (P2-A1 — RT-DETR aware):
   python scripts/active_retrieval.py \\
     --weights   runs/phase2_final_rtdetr/weights/best.pt \\
     --pool-root /data/bdd_remaining_pool \\
@@ -24,7 +23,11 @@ New CLI usage (P2-A1):
     --query-root /data/acdc_6cls_yolo/images/train \\
     --out-root  /data/bdd_active_retrieved \\
     --top-k 5000 --similarity-threshold 0.75 \\
-    --target-classes 1 3 4 --seed 42 \\
+    --target-classes 1 3 4 \\
+    --candidate-target-classes 1 3 4 \\
+    --embedding-layers 21 24 27 \\
+    --match-iou 0.5 \\
+    --seed 42 \\
     --used-bdd-root /data/bdd100k_6cls_yolo
 
 Legacy CLI (original interface — kept for backward compatibility):
@@ -95,13 +98,15 @@ CLASS_NAMES = ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
 TARGET_CLASSES = ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
 
 
-# ── Embedding extractor ────────────────────────────────────────────────────────
+# ── Legacy backbone hook ───────────────────────────────────────────────────────
 
 class BackboneHook:
-    """Hooks layer[layer_idx] of a YOLO model, returns GAP-pooled features."""
+    """Hooks layer[layer_idx] of a YOLO model, returns GAP-pooled features.
+    Kept for legacy mode backward compatibility.
+    """
 
-    def __init__(self, model: YOLO, layer_idx: int = 9):
-        self.feat: torch.Tensor | None = None
+    def __init__(self, model: "YOLO", layer_idx: int = 9):
+        self.feat = None
         self._h = model.model.model[layer_idx].register_forward_hook(self._hook)
 
     def _hook(self, module, inp, out):
@@ -112,7 +117,56 @@ class BackboneHook:
         self._h.remove()
 
 
-def preprocess_image(path: Path, imgsz: int = IMGSZ) -> torch.Tensor | None:
+# ── Multi-scale hook (new-style, P2-A1) ───────────────────────────────────────
+
+class MultiScaleHook:
+    """Hook multiple layers, GAP each output, concatenate → L2-normalize.
+
+    Designed for RT-DETR-L layers 21 (P3/RepC3), 24 (P4/RepC3), 27 (P5/RepC3),
+    each 256-channel after RepC3. After GAP+concat: 768-dim embedding.
+    """
+
+    def __init__(self, model: "YOLO", layer_indices: list):
+        self.feats: dict = {}
+        self._handles = []
+        for idx in layer_indices:
+            layer = model.model.model[idx]
+            h = layer.register_forward_hook(self._make_hook(idx))
+            self._handles.append(h)
+
+    def _make_hook(self, idx: int):
+        def hook(module, inp, out):
+            if _torch_available and torch is not None:
+                if isinstance(out, torch.Tensor) and out.ndim == 4:
+                    self.feats[idx] = out.mean(dim=[2, 3])  # GAP → [B, C]
+                elif isinstance(out, (list, tuple)) and len(out) > 0:
+                    first = out[0]
+                    if isinstance(first, torch.Tensor) and first.ndim == 4:
+                        self.feats[idx] = first.mean(dim=[2, 3])
+        return hook
+
+    def get_embedding(self, layer_indices: list) -> "torch.Tensor":
+        parts = []
+        for idx in layer_indices:
+            if idx not in self.feats:
+                raise RuntimeError(
+                    f"Layer {idx} hook did not produce output. Check layer index."
+                )
+            parts.append(self.feats[idx])
+        cat = torch.cat(parts, dim=1)  # [B, sum(C_i)]
+        return F.normalize(cat, dim=1)
+
+    def clear(self):
+        self.feats.clear()
+
+    def remove(self):
+        for h in self._handles:
+            h.remove()
+
+
+# ── Image preprocessing ────────────────────────────────────────────────────────
+
+def preprocess_image(path: Path, imgsz: int = IMGSZ) -> "torch.Tensor | None":
     img = cv2.imread(str(path))
     if img is None:
         return None
@@ -122,14 +176,16 @@ def preprocess_image(path: Path, imgsz: int = IMGSZ) -> torch.Tensor | None:
     return t
 
 
+# ── Legacy embedding extractor ─────────────────────────────────────────────────
+
 def extract_embeddings(
-    model: YOLO,
-    hook: BackboneHook,
-    paths: list[Path],
+    model: "YOLO",
+    hook: "BackboneHook",
+    paths: list,
     batch_size: int = 32,
     device: str = "cuda",
-) -> tuple[np.ndarray, list[Path]]:
-    """Return (N, C) L2-normalized embeddings and matched path list."""
+) -> "tuple[np.ndarray, list]":
+    """Legacy: Return (N, C) L2-normalized embeddings and matched path list."""
     embs, valid_paths = [], []
 
     for i in tqdm(range(0, len(paths), batch_size), desc="  Embedding", ncols=80):
@@ -157,9 +213,61 @@ def extract_embeddings(
     return np.vstack(embs), valid_paths
 
 
-# ── Hard sample finder ─────────────────────────────────────────────────────────
+# ── Multi-scale embedding extractor (new-style) ────────────────────────────────
 
-def has_target_in_label(label_path: Path, target_classes: set[int]) -> bool:
+def extract_embeddings_multi(
+    model: "YOLO",
+    hook: "MultiScaleHook",
+    layer_indices: list,
+    paths: list,
+    batch_size: int = 32,
+    device: str = "cuda",
+    has_rtdetr: bool = False,
+) -> "tuple[np.ndarray, list]":
+    """New-style: multi-scale GAP embeddings, L2-normalized. Returns (N, D) array."""
+    embs, valid_paths = [], []
+    first_batch = True
+
+    for i in tqdm(range(0, len(paths), batch_size), desc="  Embedding", ncols=80):
+        batch_paths = paths[i : i + batch_size]
+        tensors = []
+        kept = []
+        for p in batch_paths:
+            t = preprocess_image(p)
+            if t is not None:
+                tensors.append(t)
+                kept.append(p)
+
+        if not tensors:
+            continue
+
+        batch = torch.stack(tensors).to(device)
+        with torch.no_grad():
+            model.model(batch)  # triggers hooks
+
+        if first_batch:
+            shapes = {idx: list(hook.feats[idx].shape) for idx in layer_indices if idx in hook.feats}
+            total_dim = sum(v[-1] for v in shapes.values())
+            model_type = "RT-DETR (RTDETRDecoder)" if has_rtdetr else "YOLO/other"
+            print(f"  Embedding model type: {model_type}")
+            print(f"  Embedding layers: {layer_indices}")
+            print(f"  Layer output shapes (after GAP): {shapes}")
+            print(f"  Final embedding dimension: {total_dim}")
+            first_batch = False
+
+        emb = hook.get_embedding(layer_indices)  # [B, D] L2-normalized
+        embs.append(emb.cpu().numpy())
+        hook.clear()
+        valid_paths.extend(kept)
+
+    if not embs:
+        return np.zeros((0, 0), dtype=np.float32), []
+    return np.vstack(embs), valid_paths
+
+
+# ── Hard sample finder (legacy) ────────────────────────────────────────────────
+
+def has_target_in_label(label_path: Path, target_classes: set) -> bool:
     if not label_path.exists():
         return False
     for line in label_path.read_text().splitlines():
@@ -170,24 +278,23 @@ def has_target_in_label(label_path: Path, target_classes: set[int]) -> bool:
 
 
 def find_hard_samples(
-    model: YOLO,
+    model: "YOLO",
     image_dir: Path,
-    label_dir: Path | None,
-    target_classes: set[int],
+    label_dir: "Path | None",
+    target_classes: set,
     conf_hard: float,
     batch_size: int = 1,
-) -> tuple[list[Path], list[Path | None], dict[str, float]]:
+) -> "tuple[list, list, dict]":
     """
-    Hard sample = image has target class in GT but model detects with
+    Legacy hard sample mining: image has target class in GT but model detects with
     max confidence < conf_hard (or no detection at all).
-    If no label_dir, treat every image as a candidate and check confidence only.
 
     Returns: (hard_img_paths, hard_lbl_paths, hardness_scores)
     hardness_scores: {img_name -> max_conf on target class}
     """
     img_paths = sorted(p for p in image_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS)
     hard_imgs, hard_lbls = [], []
-    hardness_scores: dict[str, float] = {}
+    hardness_scores: dict = {}
     skipped = 0
 
     for img_path in tqdm(img_paths, desc="  Hard mining", ncols=80):
@@ -218,24 +325,208 @@ def find_hard_samples(
     return hard_imgs, hard_lbls, hardness_scores
 
 
-# ── Retrieval ──────────────────────────────────────────────────────────────────
+# ── GT-aware IoU utilities ─────────────────────────────────────────────────────
+
+def compute_iou(
+    gt_box_xywh_norm: list,
+    pred_boxes_xyxy_abs: "np.ndarray",
+    img_w: int,
+    img_h: int,
+) -> "np.ndarray":
+    """Compute IoU between one GT box (YOLO xywh normalized) and N pred boxes (xyxy absolute)."""
+    cx, cy, bw, bh = gt_box_xywh_norm
+    gx1 = (cx - bw / 2) * img_w
+    gy1 = (cy - bh / 2) * img_h
+    gx2 = (cx + bw / 2) * img_w
+    gy2 = (cy + bh / 2) * img_h
+
+    px1 = pred_boxes_xyxy_abs[:, 0]
+    py1 = pred_boxes_xyxy_abs[:, 1]
+    px2 = pred_boxes_xyxy_abs[:, 2]
+    py2 = pred_boxes_xyxy_abs[:, 3]
+
+    ix1 = np.maximum(gx1, px1)
+    iy1 = np.maximum(gy1, py1)
+    ix2 = np.minimum(gx2, px2)
+    iy2 = np.minimum(gy2, py2)
+    inter = np.maximum(0.0, ix2 - ix1) * np.maximum(0.0, iy2 - iy1)
+
+    gt_area = (gx2 - gx1) * (gy2 - gy1)
+    pred_area = (px2 - px1) * (py2 - py1)
+    union = gt_area + pred_area - inter
+    return np.where(union > 0, inter / union, 0.0)
+
+
+def is_gt_hard(
+    gt_cls: int,
+    gt_box: list,
+    pred_classes: list,
+    pred_confs: list,
+    pred_boxes_xyxy: "np.ndarray",
+    img_w: int,
+    img_h: int,
+    conf_hard: float,
+    match_iou: float,
+) -> "tuple[bool, float]":
+    """
+    A GT box is hard if:
+    A. No same-class prediction with IoU >= match_iou exists (missed GT → matched_conf = 0)
+    OR
+    B. Best same-class prediction IoU >= match_iou but confidence < conf_hard (weak detection)
+
+    Returns: (is_hard, matched_confidence)
+    matched_confidence = 0.0 if missed, else best-matched prediction confidence
+    """
+    same_class_mask = np.array([c == gt_cls for c in pred_classes], dtype=bool)
+    if not np.any(same_class_mask):
+        return True, 0.0  # missed GT entirely
+
+    sc_boxes = pred_boxes_xyxy[same_class_mask]
+    sc_confs = np.array(pred_confs)[same_class_mask]
+    ious = compute_iou(gt_box, sc_boxes, img_w, img_h)
+    matched = ious >= match_iou
+    if not np.any(matched):
+        return True, 0.0  # no matching prediction → missed
+
+    best_conf = float(sc_confs[matched].max())
+    if best_conf < conf_hard:
+        return True, best_conf  # weak detection
+    return False, best_conf  # detected well
+
+
+def find_hard_samples_gt_aware(
+    model: "YOLO",
+    image_dir: Path,
+    label_dir: Path,
+    target_classes: set,
+    conf_hard: float,
+    match_iou: float,
+    query_dataset: str = "",
+) -> "tuple[list, dict, dict]":
+    """
+    GT-aware hard sample mining with per-GT-box IoU matching.
+
+    Hardness score = max over hard GTs of (1 - matched_confidence)
+    A completely missed GT has matched_confidence=0, hardness=1.0.
+
+    Returns: (hard_img_paths, hardness_scores, img_to_dataset)
+    img_to_dataset: {img_name -> query_dataset string}
+    """
+    img_paths = sorted(p for p in image_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS)
+    hard_imgs = []
+    hardness_scores: dict = {}   # canonical_key -> hardness score
+    img_to_dataset: dict = {}    # canonical_key -> dataset name
+    skipped_no_gt = 0
+    skipped_easy = 0
+
+    for img_path in tqdm(img_paths, desc=f"  Hard mining ({query_dataset or image_dir.name})", ncols=80):
+        lbl_path = label_dir / f"{img_path.stem}.txt"
+        if not lbl_path.exists():
+            skipped_no_gt += 1
+            continue
+
+        # Parse GT boxes for target classes
+        gt_boxes = []  # (cls, [cx, cy, w, h])
+        for line in lbl_path.read_text().splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 5:
+                cls = int(float(parts[0]))
+                if cls in target_classes:
+                    gt_boxes.append((cls, [float(x) for x in parts[1:5]]))
+
+        if not gt_boxes:
+            skipped_no_gt += 1
+            continue
+
+        # Run inference low-conf to see all detections
+        results = model.predict(str(img_path), verbose=False, conf=0.01, imgsz=IMGSZ)
+        pred_classes: list = []
+        pred_confs: list = []
+        pred_boxes_xyxy: list = []
+        img_h_pred = IMGSZ
+        img_w_pred = IMGSZ
+
+        for r in results:
+            if r.boxes is not None and len(r.boxes):
+                img_h_pred, img_w_pred = r.orig_shape
+                pred_classes = [int(c) for c in r.boxes.cls.cpu().tolist()]
+                pred_confs = r.boxes.conf.cpu().tolist()
+                pred_boxes_xyxy = r.boxes.xyxy.cpu().numpy()
+            else:
+                img_h_pred, img_w_pred = IMGSZ, IMGSZ
+
+        pred_boxes_xyxy_arr = np.array(pred_boxes_xyxy) if len(pred_boxes_xyxy) > 0 else np.zeros((0, 4))
+
+        # Check each GT box
+        max_hardness = 0.0
+        image_is_hard = False
+        for gt_cls, gt_box in gt_boxes:
+            hard, matched_conf = is_gt_hard(
+                gt_cls, gt_box, pred_classes, pred_confs,
+                pred_boxes_xyxy_arr, img_w_pred, img_h_pred,
+                conf_hard=conf_hard, match_iou=match_iou,
+            )
+            if hard:
+                image_is_hard = True
+                hardness = 1.0 - matched_conf  # 1.0 = completely missed
+                max_hardness = max(max_hardness, hardness)
+
+        if image_is_hard:
+            # Use canonical resolved path as key to avoid basename collisions
+            # across datasets (e.g. XWOD and ACDC may share filenames)
+            canonical_key = str(img_path.resolve())
+            hard_imgs.append(img_path)
+            hardness_scores[canonical_key] = max_hardness
+            img_to_dataset[canonical_key] = query_dataset
+        else:
+            skipped_easy += 1
+
+    names = [CLASS_NAMES[c] for c in sorted(target_classes) if c < len(CLASS_NAMES)]
+    print(f"  Hard: {len(hard_imgs)}/{len(img_paths)} "
+          f"(skipped {skipped_no_gt} no-GT, {skipped_easy} easy; classes: {names})")
+    return hard_imgs, hardness_scores, img_to_dataset
+
+
+# ── Candidate class filter ─────────────────────────────────────────────────────
+
+def filter_pool_by_class(
+    pool_img_dir: Path,
+    pool_lbl_dir: Path,
+    target_classes: set,
+) -> "tuple[list, int]":
+    """Return pool images that contain at least one target class in their label."""
+    all_paths = sorted(p for p in pool_img_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS)
+    before = len(all_paths)
+    filtered = []
+    for img in all_paths:
+        lbl = pool_lbl_dir / f"{img.stem}.txt"
+        if lbl.exists():
+            for line in lbl.read_text().splitlines():
+                parts = line.strip().split()
+                if parts and int(float(parts[0])) in target_classes:
+                    filtered.append(img)
+                    break
+    return filtered, before
+
+
+# ── Legacy retrieval ───────────────────────────────────────────────────────────
 
 def retrieve_from_pool(
-    hard_embs: np.ndarray,
-    pool_embs: np.ndarray,
-    pool_paths: list[Path],
+    hard_embs: "np.ndarray",
+    pool_embs: "np.ndarray",
+    pool_paths: list,
     sim_threshold: float,
     top_n: int,
-    exclude_stems: set[str] | None = None,
-) -> list[tuple[Path, float]]:
+    exclude_stems: "set | None" = None,
+) -> "list[tuple[Path, float]]":
     """
-    For each hard sample, find pool images with cosine sim >= threshold.
+    Legacy: For each hard sample, find pool images with cosine sim >= threshold.
     Returns deduplicated list of (pool_path, max_sim_score) sorted by score desc.
     Limits to top_n total. Uses (-sim, name) tie-breaking for determinism.
     """
     sim_matrix = hard_embs @ pool_embs.T  # both L2-normalized → cosine sim
 
-    selected: dict[str, tuple[Path, float]] = {}  # stem → (path, score)
+    selected: dict = {}  # stem → (path, score)
 
     for h_idx in range(sim_matrix.shape[0]):
         sims = sim_matrix[h_idx]
@@ -256,11 +547,182 @@ def retrieve_from_pool(
     return ranked[:top_n]
 
 
+# ── New-style retrieval with provenance ────────────────────────────────────────
+
+def retrieve_from_pool_with_provenance(
+    hard_embs: "np.ndarray",
+    hard_paths: list,
+    hardness_scores: dict,
+    img_to_dataset: dict,
+    pool_embs: "np.ndarray",
+    pool_paths: list,
+    sim_threshold: float,
+    top_n: int,
+) -> "tuple[list[dict], dict]":
+    """
+    New-style retrieval with query provenance tracking.
+
+    Returns:
+      selected: list of dicts with keys:
+        pool_path, sim, query_path, query_dataset, hardness_score
+      stats: dict with dedup statistics
+    """
+    sim_matrix = hard_embs @ pool_embs.T  # [H, P] cosine similarities
+
+    # stem → {pool_path, sim, query_path, query_dataset, hardness_score}
+    best_per_stem: dict = {}
+    candidate_hits_above_threshold = 0
+
+    for h_idx, hard_path in enumerate(hard_paths):
+        # Canonical key: resolved path string (avoids basename collision across datasets)
+        canonical_key = str(hard_path.resolve())
+        sims = sim_matrix[h_idx]
+        order = np.argsort(-sims)
+        for p_idx in order:
+            score = float(sims[p_idx])
+            if score < sim_threshold:
+                break
+            candidate_hits_above_threshold += 1
+            p_path = pool_paths[p_idx]
+            stem = p_path.stem
+            if stem not in best_per_stem or best_per_stem[stem]["sim"] < score:
+                best_per_stem[stem] = {
+                    "pool_path": p_path,
+                    "sim": score,
+                    "query_path": hard_path,
+                    "query_dataset": img_to_dataset.get(canonical_key, ""),
+                    "hardness_score": hardness_scores.get(canonical_key, 0.0),
+                }
+
+    unique_before_topk = len(best_per_stem)
+    duplicate_removed = candidate_hits_above_threshold - unique_before_topk
+
+    # Deterministic sort: (-sim, pool_name)
+    ranked = sorted(best_per_stem.values(), key=lambda x: (-x["sim"], x["pool_path"].name))
+    selected = ranked[:top_n]
+
+    stats = {
+        "candidate_hits_above_threshold": candidate_hits_above_threshold,
+        "unique_candidates_before_top_k": unique_before_topk,
+        "duplicate_candidate_hits_removed": duplicate_removed,
+        "selected_unique": len(selected),
+    }
+    return selected, stats
+
+
+# ── Query root validation ──────────────────────────────────────────────────────
+
+def validate_query_root(qr: Path) -> Path:
+    """Require query-root to be */images/train. Fail if val or test."""
+    qr = qr.resolve()
+    parts = qr.parts
+    if "images" not in parts:
+        raise SystemExit(
+            f"ERROR: --query-root must be inside an 'images/' directory: {qr}"
+        )
+    idx = list(parts).index("images")
+    split = parts[idx + 1] if idx + 1 < len(parts) else ""
+    if split in ("val", "test"):
+        raise SystemExit(
+            f"ERROR: --query-root points to '{split}' split: {qr}\n"
+            "Querying val/test splits is a leakage violation. Pass only train splits."
+        )
+    if split != "train":
+        raise SystemExit(
+            f"ERROR: --query-root last path component under 'images/' must be 'train', "
+            f"got '{split}': {qr}"
+        )
+    lbl_dir = Path(*list(parts)[:idx]) / "labels" / "train"
+    if not lbl_dir.exists():
+        raise SystemExit(f"ERROR: Expected label dir does not exist: {lbl_dir}")
+    return qr
+
+
+# ── Cache metadata helpers ─────────────────────────────────────────────────────
+
+def _pool_fingerprint(pool_paths: list) -> str:
+    """SHA-256 of sorted pool basenames — detects filename changes even when count is same."""
+    import hashlib
+    h = hashlib.sha256()
+    for p in sorted(pool_paths, key=lambda x: x.name):
+        h.update((p.name + "\n").encode())
+    return h.hexdigest()[:32]
+
+
+def _cache_fingerprint(
+    weights_path: Path,
+    layer_indices: list,
+    imgsz: int,
+    pool_paths: list,
+) -> dict:
+    import hashlib
+    weights_path = Path(weights_path)
+    try:
+        size = weights_path.stat().st_size
+        with open(weights_path, "rb") as f:
+            partial = f.read(65536)
+        sha = hashlib.sha256(partial).hexdigest()[:16]
+    except OSError:
+        size, sha = -1, "unknown"
+    return {
+        "checkpoint": str(weights_path),
+        "checkpoint_size": size,
+        "checkpoint_sha256_prefix": sha,
+        "embedding_layers": layer_indices,
+        "imgsz": imgsz,
+        "pool_count": len(pool_paths),
+        "pool_fingerprint": _pool_fingerprint(pool_paths),
+        "version": 3,
+    }
+
+
+def load_pool_cache(
+    cache_path: Path,
+    expected_meta: dict,
+) -> "tuple[np.ndarray, list] | None":
+    if not cache_path.exists():
+        return None
+    try:
+        data = np.load(cache_path, allow_pickle=True)
+        if "meta" not in data:
+            print("  Cache missing metadata — rebuilding.")
+            return None
+        cached_meta = json.loads(str(data["meta"]))
+        mismatches = {k for k in expected_meta if cached_meta.get(k) != expected_meta[k]}
+        if mismatches:
+            print(f"  Cache metadata mismatch on {mismatches} — rebuilding.")
+            return None
+        pool_embs = data["embs"]
+        pool_paths = [Path(str(p)) for p in data["paths"]]
+        print(f"  Loaded {len(pool_paths)} cached embeddings (metadata verified).")
+        return pool_embs, pool_paths
+    except Exception as e:
+        print(f"  Cache load failed ({e}) — rebuilding.")
+        return None
+
+
+def save_pool_cache(
+    cache_path: Path,
+    embs: "np.ndarray",
+    paths: list,
+    meta: dict,
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_json = json.dumps(meta)
+    np.savez(
+        cache_path,
+        embs=embs,
+        paths=np.array([str(p) for p in paths]),
+        meta=np.array(meta_json),
+    )
+    print(f"  Pool embeddings cached → {cache_path}")
+
+
 # ── Export (legacy) ────────────────────────────────────────────────────────────
 
 def export_retrieved(
-    selected: list[tuple[Path, float]],
-    pool_label_dir: Path | None,
+    selected: "list[tuple[Path, float]]",
+    pool_label_dir: "Path | None",
     out_dir: Path,
 ) -> None:
     img_out = out_dir / "images"
@@ -298,7 +760,7 @@ def export_retrieved(
 
 # ── Stats ──────────────────────────────────────────────────────────────────────
 
-def count_class_dist(label_dir: Path, target_classes: set[int]) -> dict[int, int]:
+def count_class_dist(label_dir: Path, target_classes: set) -> dict:
     counts = {c: 0 for c in target_classes}
     for lbl in label_dir.glob("*.txt"):
         for line in lbl.read_text().splitlines():
@@ -310,9 +772,9 @@ def count_class_dist(label_dir: Path, target_classes: set[int]) -> dict[int, int
     return counts
 
 
-def validate_labels(label_dir: Path, max_class_id: int = 5) -> list[str]:
+def validate_labels(label_dir: Path, max_class_id: int = 5) -> list:
     """Check all label files for invalid class IDs. Returns list of violation messages."""
-    violations: list[str] = []
+    violations: list = []
     for lbl in label_dir.glob("*.txt"):
         for i, line in enumerate(lbl.read_text().splitlines()):
             parts = line.strip().split()
@@ -340,7 +802,9 @@ def place_file(src: Path, dst: Path, mode: str) -> None:
 # ── New-style main (P2-A1) ─────────────────────────────────────────────────────
 
 def parse_args_new() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Active retrieval: hard mining + cosine similarity pool search (P2-A1)")
+    p = argparse.ArgumentParser(
+        description="Active retrieval: GT-aware hard mining + cosine similarity pool search (P2-A1, RT-DETR aware)"
+    )
     p.add_argument("--weights", required=True, help="Phase2 best.pt checkpoint")
     p.add_argument("--pool-root", required=True, type=Path,
                    help="BDD remaining pool root (output of build_bdd_retrieval_pool.py)")
@@ -353,14 +817,24 @@ def parse_args_new() -> argparse.Namespace:
     p.add_argument("--target-classes", nargs="+", type=int, default=[1, 3, 4],
                    help="Class IDs to mine (default: 1=bicycle 3=motorcycle 4=bus)")
     p.add_argument("--conf-hard", type=float, default=0.25)
-    p.add_argument("--layer-idx", type=int, default=9)
+    p.add_argument("--match-iou", type=float, default=0.5,
+                   help="IoU threshold for GT-aware hard mining (default: 0.5)")
+    p.add_argument("--embedding-layers", nargs="+", type=int, default=[21, 24, 27],
+                   help="Layer indices to hook for multi-scale embedding (default: 21 24 27 for RT-DETR-L P3/P4/P5)")
+    p.add_argument("--candidate-target-classes", nargs="+", type=int, default=[1, 3, 4],
+                   help="Filter pool by label content; use -1 to disable (default: 1 3 4)")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--device", default=None, help="cuda or cpu (auto-detected if omitted)")
     p.add_argument("--cache-pool-embs", type=Path, default=None,
-                   help="Path to save/load pool embeddings cache (.npz)")
+                   help="Path to save/load pool embeddings cache (.npz) with metadata validation")
     p.add_argument("--used-bdd-root", type=Path, default=None,
                    help="BDD30K root already in project — used for post-selection leakage check")
     p.add_argument("--mode", choices=["symlink", "copy"], default="symlink")
+    p.add_argument("--clean", action="store_true",
+                   help="Remove --out-root completely before writing. Without --clean, "
+                        "fails if output already contains images or labels from a previous run.")
+    p.add_argument("--smoke-check", action="store_true",
+                   help="Load model, run one forward on dummy image, print shapes, exit 0.")
     return p.parse_args()
 
 
@@ -387,10 +861,7 @@ def parse_args_legacy() -> argparse.Namespace:
 
 
 def _detect_new_style() -> bool:
-    """Return True if --weights / --pool-root / --query-root style args are present.
-    Also returns True for --help / -h when no legacy-only flags are present,
-    so that the default help output shows the new-style (P2-A1) interface.
-    """
+    """Return True if --weights / --pool-root / --query-root style args are present."""
     argv = sys.argv[1:]
     new_style_flags = {"--weights", "--pool-root", "--query-root"}
     help_flags = {"-h", "--help"}
@@ -403,67 +874,178 @@ def _detect_new_style() -> bool:
     return False
 
 
+def _infer_query_dataset(query_root: Path) -> str:
+    """Infer dataset name from path: look for 'xwod' or 'acdc' (case-insensitive)."""
+    path_str = str(query_root).lower()
+    if "xwod" in path_str:
+        return "xwod"
+    if "acdc" in path_str:
+        return "acdc"
+    return query_root.parent.name
+
+
 def main_new(args: argparse.Namespace) -> None:
-    """P2-A1 main: new CLI interface."""
+    """P2-A1 main: new CLI interface with RT-DETR multi-scale embedding."""
     target_classes = set(args.target_classes)
+    embedding_layers = args.embedding_layers
+    match_iou = args.match_iou
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     rng = random.Random(args.seed)
+    _ = rng  # seed used for future random operations
     out_root = args.out_root.resolve()
+
+    # Clean / stale-output guard
+    if hasattr(args, "clean") and args.clean:
+        if out_root.exists():
+            print(f"  --clean: removing existing output at {out_root}")
+            shutil.rmtree(out_root)
+    else:
+        # Without --clean, fail if stale images/labels exist
+        stale_img = out_root / "images" / "train"
+        stale_lbl = out_root / "labels" / "train"
+        stale = []
+        if stale_img.exists() and any(stale_img.iterdir()):
+            stale.append(str(stale_img))
+        if stale_lbl.exists() and any(stale_lbl.iterdir()):
+            stale.append(str(stale_lbl))
+        if stale:
+            raise RuntimeError(
+                f"Output directory is non-empty: {stale}\n"
+                "Rerunning without --clean would silently merge stale retrieval results.\n"
+                "Pass --clean to remove and rebuild, or delete the output manually."
+            )
+
     out_root.mkdir(parents=True, exist_ok=True)
 
+    # Candidate target class filter
+    candidate_target_classes_raw = args.candidate_target_classes
+    use_class_filter = candidate_target_classes_raw != [-1]
+    candidate_target_classes = set(candidate_target_classes_raw) if use_class_filter else None
+
     print(f"\n{'='*60}")
-    print("Active Retrieval (P2-A1 — failure-driven BDD retrieval)")
-    print(f"  weights:    {args.weights}")
-    print(f"  pool-root:  {args.pool_root}")
-    print(f"  query-roots: {[str(q) for q in args.query_roots]}")
-    print(f"  top-k:      {args.top_k}")
-    print(f"  sim-thresh: {args.similarity_threshold}")
-    print(f"  target:     {[CLASS_NAMES[c] for c in sorted(target_classes)]}")
-    print(f"  seed:       {args.seed}")
-    print(f"  device:     {device}")
+    print("Active Retrieval (P2-A1 — RT-DETR aware, GT-matched, failure-driven)")
+    print(f"  weights:         {args.weights}")
+    print(f"  pool-root:       {args.pool_root}")
+    print(f"  query-roots:     {[str(q) for q in args.query_roots]}")
+    print(f"  top-k:           {args.top_k}")
+    print(f"  sim-thresh:      {args.similarity_threshold}")
+    print(f"  target:          {[CLASS_NAMES[c] for c in sorted(target_classes)]}")
+    print(f"  embedding-layers: {embedding_layers}")
+    print(f"  match-iou:       {match_iou}")
+    print(f"  seed:            {args.seed}")
+    print(f"  device:          {device}")
     print(f"{'='*60}\n")
 
-    # Pool
+    # Validate query roots (train-only enforcement)
+    validated_roots = []
+    for qr in args.query_roots:
+        validated_roots.append(validate_query_root(qr))
+    args.query_roots = validated_roots
+
+    # Smoke check
+    if args.smoke_check:
+        print("[SMOKE] Loading model for smoke check...")
+        model = YOLO(str(args.weights))
+        model.to(device)
+
+        try:
+            from ultralytics.nn.modules.head import RTDETRDecoder  # type: ignore[import]
+            has_rtdetr = any(isinstance(m, RTDETRDecoder) for m in model.model.model)
+        except ImportError:
+            has_rtdetr = False
+
+        hook = MultiScaleHook(model, embedding_layers)
+        dummy = torch.zeros(1, 3, IMGSZ, IMGSZ).to(device)
+        with torch.no_grad():
+            model.model(dummy)
+        shapes = {idx: list(hook.feats[idx].shape) for idx in embedding_layers if idx in hook.feats}
+        total_dim = sum(v[-1] for v in shapes.values())
+        model_type = "RT-DETR (RTDETRDecoder)" if has_rtdetr else "YOLO/other"
+        print(f"  Model type: {model_type}")
+        print(f"  Embedding layers: {embedding_layers}")
+        print(f"  Layer output shapes (after GAP): {shapes}")
+        print(f"  Final embedding dimension: {total_dim}")
+        hook.remove()
+        print("SMOKE CHECK: PASS")
+        raise SystemExit(0)
+
+    # Pool paths
     pool_img_dir = args.pool_root / "images" / "train"
     pool_lbl_dir = args.pool_root / "labels" / "train"
     pool_paths = sorted(p for p in pool_img_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS)
+    pool_count_before_filter = len(pool_paths)
     print(f"[1/4] Pool size: {len(pool_paths)} images")
+
+    # Candidate class filter
+    if use_class_filter and candidate_target_classes:
+        print(f"  Filtering pool to images with classes {sorted(candidate_target_classes)}...")
+        pool_paths, pool_count_before_filter = filter_pool_by_class(
+            pool_img_dir, pool_lbl_dir, candidate_target_classes
+        )
+        print(f"  Pool after class filter: {len(pool_paths)} / {pool_count_before_filter}")
+    pool_count_after_filter = len(pool_paths)
 
     # Load model
     print("[2/4] Loading checkpoint...")
     model = YOLO(str(args.weights))
     model.to(device)
-    hook = BackboneHook(model, layer_idx=args.layer_idx)
 
-    # Pool embeddings
+    # Detect RT-DETR
+    has_rtdetr = False
+    try:
+        from ultralytics.nn.modules.head import RTDETRDecoder  # type: ignore[import]
+        has_rtdetr = any(isinstance(m, RTDETRDecoder) for m in model.model.model)
+    except ImportError:
+        pass
+
+    # For the P2-A1 default multi-scale layers [21, 24, 27], require RT-DETR.
+    # These layer indices are specific to rtdetr-l.yaml and do not exist in YOLO models.
+    _P2A1_RTDETR_LAYERS = [21, 24, 27]
+    if sorted(embedding_layers) == sorted(_P2A1_RTDETR_LAYERS) and not has_rtdetr:
+        raise RuntimeError(
+            f"HARD FAIL: --embedding-layers {embedding_layers} require an RT-DETR model "
+            "(layers 21/24/27 are RT-DETR P3/P4/P5 RepC3 head features), "
+            "but RTDETRDecoder was NOT found in the loaded checkpoint.\n"
+            "For YOLO models use --embedding-layers 9. "
+            "For RT-DETR, ensure you pass the correct best.pt."
+        )
+    if embedding_layers != [9] and not has_rtdetr:
+        print(f"  WARNING: --embedding-layers {embedding_layers} with non-RT-DETR model. "
+              "Continuing — hooks may still fire if layers exist.")
+    model_type_str = "RT-DETR-L (RTDETRDecoder detected)" if has_rtdetr else "YOLO/other"
+    print(f"  Model type: {model_type_str}")
+
+    hook = MultiScaleHook(model, embedding_layers)
+
+    # Pool embeddings (with cache metadata validation)
     cache_path = args.cache_pool_embs
-    if cache_path and cache_path.exists():
-        print(f"  Loading cached pool embeddings from {cache_path}")
-        data = np.load(cache_path, allow_pickle=True)
-        pool_embs = data["embs"]
-        pool_paths = [Path(str(p)) for p in data["paths"]]
-        print(f"  Loaded {len(pool_paths)} cached embeddings")
-    else:
-        pool_embs, pool_paths = extract_embeddings(
-            model, hook, pool_paths, batch_size=args.batch_size, device=device
+    pool_embs = None
+    if cache_path:
+        expected_meta = _cache_fingerprint(args.weights, embedding_layers, IMGSZ, pool_paths)
+        cached = load_pool_cache(cache_path, expected_meta)
+        if cached is not None:
+            pool_embs, pool_paths = cached
+    if pool_embs is None:
+        pool_embs, pool_paths = extract_embeddings_multi(
+            model, hook, embedding_layers, pool_paths,
+            batch_size=args.batch_size, device=device, has_rtdetr=has_rtdetr,
         )
         if cache_path:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez(cache_path, embs=pool_embs, paths=np.array([str(p) for p in pool_paths]))
-            print(f"  Pool embeddings cached → {cache_path}")
+            expected_meta = _cache_fingerprint(args.weights, embedding_layers, IMGSZ, pool_paths)
+            save_pool_cache(cache_path, pool_embs, pool_paths, expected_meta)
 
     # Hard sample mining from all query dirs
-    print("\n[3/4] Mining hard samples from query dirs...")
-    all_hard_imgs: list[Path] = []
-    all_hard_lbls: list[Path | None] = []
-    all_hardness: dict[str, float] = {}
+    print("\n[3/4] GT-aware hard mining from query dirs...")
+    all_hard_imgs: list = []
+    all_hardness: dict = {}
+    all_img_to_dataset: dict = {}
     query_count = 0
 
     for query_root in args.query_roots:
         query_root = query_root.resolve()
         # Infer label dir: images/train → labels/train
-        lbl_dir = None
         parts = query_root.parts
+        lbl_dir = None
         if "images" in parts:
             idx = list(parts).index("images")
             lbl_parts = list(parts)
@@ -471,46 +1053,69 @@ def main_new(args: argparse.Namespace) -> None:
             lbl_dir = Path(*lbl_parts)
             if not lbl_dir.exists():
                 lbl_dir = None
+
         imgs_here = sorted(p for p in query_root.rglob("*") if p.suffix.lower() in IMAGE_EXTS)
         query_count += len(imgs_here)
-        hard_imgs, hard_lbls, hardness = find_hard_samples(
-            model, query_root, lbl_dir, target_classes, args.conf_hard,
-        )
+        query_dataset = _infer_query_dataset(query_root)
+
+        if lbl_dir is not None:
+            hard_imgs, hardness, img_to_ds = find_hard_samples_gt_aware(
+                model, query_root, lbl_dir, target_classes,
+                conf_hard=args.conf_hard, match_iou=match_iou,
+                query_dataset=query_dataset,
+            )
+        else:
+            print(f"  WARNING: No label dir found for {query_root} — skipping GT-aware mining.")
+            hard_imgs, hardness, img_to_ds = [], {}, {}
+
         all_hard_imgs.extend(hard_imgs)
-        all_hard_lbls.extend(hard_lbls)
         all_hardness.update(hardness)
+        all_img_to_dataset.update(img_to_ds)
 
     if not all_hard_imgs:
-        print("  No hard samples found. Try lowering --conf-hard.")
+        print("  No hard samples found. Try lowering --conf-hard or --match-iou.")
         hook.remove()
         return
 
     print(f"  Total hard samples across all query dirs: {len(all_hard_imgs)}")
     print("  Extracting hard sample embeddings...")
-    hard_embs, all_hard_imgs = extract_embeddings(
-        model, hook, all_hard_imgs, batch_size=args.batch_size, device=device
+    hook.clear()  # clear any stale feats from predict calls during mining
+    hard_embs, all_hard_imgs = extract_embeddings_multi(
+        model, hook, embedding_layers, all_hard_imgs,
+        batch_size=args.batch_size, device=device, has_rtdetr=has_rtdetr,
     )
     hook.remove()
 
-    # Retrieval
+    # Compute total embedding dim
+    embedding_dim = hard_embs.shape[1] if hard_embs.ndim == 2 else 0
+
+    # Retrieval with provenance
     print(f"\n[4/4] Retrieving from pool (sim >= {args.similarity_threshold}, top-{args.top_k})...")
-    selected = retrieve_from_pool(
-        hard_embs, pool_embs, pool_paths,
+    selected, ret_stats = retrieve_from_pool_with_provenance(
+        hard_embs=hard_embs,
+        hard_paths=all_hard_imgs,
+        hardness_scores=all_hardness,
+        img_to_dataset=all_img_to_dataset,
+        pool_embs=pool_embs,
+        pool_paths=pool_paths,
         sim_threshold=args.similarity_threshold,
         top_n=args.top_k,
     )
-    print(f"  Retrieved: {len(selected)} unique pool images above threshold")
+    print(f"  Candidate hits above threshold: {ret_stats['candidate_hits_above_threshold']}")
+    print(f"  Unique candidates (before top-k): {ret_stats['unique_candidates_before_top_k']}")
+    print(f"  Duplicates removed: {ret_stats['duplicate_candidate_hits_removed']}")
+    print(f"  Selected unique: {ret_stats['selected_unique']}")
 
     # Leakage check
     if args.used_bdd_root:
-        used_bdd_names: set[str] = set()
+        used_bdd_names: set = set()
         for split in ("train", "val", "test"):
             split_dir = args.used_bdd_root / "images" / split
             if split_dir.exists():
                 for p in split_dir.iterdir():
                     if p.suffix.lower() in IMAGE_EXTS:
                         used_bdd_names.add(p.name)
-        retrieved_names = {img.name for img, _ in selected}
+        retrieved_names = {entry["pool_path"].name for entry in selected}
         overlap = retrieved_names & used_bdd_names
         if overlap:
             raise RuntimeError(
@@ -521,9 +1126,9 @@ def main_new(args: argparse.Namespace) -> None:
     else:
         overlap_count = -1  # not checked
 
-    # HARD INVARIANTS
-    assert len(selected) <= args.top_k, "selected_unique > top_k — invariant violated"
-    retrieved_basenames = [img.name for img, _ in selected]
+    # Hard invariants
+    assert ret_stats["selected_unique"] <= args.top_k, "selected_unique > top_k — invariant violated"
+    retrieved_basenames = [entry["pool_path"].name for entry in selected]
     assert len(retrieved_basenames) == len(set(retrieved_basenames)), "duplicate retrieved image names"
 
     # Write output
@@ -532,19 +1137,24 @@ def main_new(args: argparse.Namespace) -> None:
     out_img_dir.mkdir(parents=True, exist_ok=True)
     out_lbl_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest_rows: list[dict] = []
-    for rank, (img_path, sim) in enumerate(selected, start=1):
+    manifest_rows: list = []
+    for rank, entry in enumerate(selected, start=1):
+        img_path = entry["pool_path"]
+        sim = entry["sim"]
+        query_path = entry["query_path"]
+        query_dataset = entry["query_dataset"]
+        hardness = entry["hardness_score"]
         lbl_path = pool_lbl_dir / f"{img_path.stem}.txt"
         place_file(img_path, out_img_dir / img_path.name, args.mode)
         if lbl_path.exists():
             place_file(lbl_path, out_lbl_dir / lbl_path.name, args.mode)
-        hardness = all_hardness.get(img_path.name, "")
         manifest_rows.append({
             "retrieved_image": str(out_img_dir / img_path.name),
             "retrieved_label": str(out_lbl_dir / lbl_path.name) if lbl_path.exists() else "",
             "source_image_name": img_path.name,
             "source_split": "bdd_train",
-            "query_image": "",
+            "query_image": str(query_path) if query_path else "",
+            "query_dataset": query_dataset,
             "similarity": f"{sim:.6f}",
             "hardness_score": f"{hardness:.6f}" if isinstance(hardness, float) else "",
             "rank": rank,
@@ -566,23 +1176,63 @@ def main_new(args: argparse.Namespace) -> None:
     with (out_root / "retrieved_manifest.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "retrieved_image", "retrieved_label", "source_image_name", "source_split",
-            "query_image", "similarity", "hardness_score", "rank", "selected_reason",
+            "query_image", "query_dataset", "similarity", "hardness_score", "rank", "selected_reason",
         ])
         writer.writeheader()
         writer.writerows(manifest_rows)
 
+    # Output count invariants
+    output_img_count = sum(
+        1 for p in out_img_dir.iterdir()
+        if p.suffix.lower() in IMAGE_EXTS and (p.is_file() or p.is_symlink())
+    )
+    output_lbl_count = sum(
+        1 for p in out_lbl_dir.iterdir()
+        if p.suffix.lower() == ".txt" and (p.is_file() or p.is_symlink())
+    )
+    manifest_row_count = len(manifest_rows)
+    selected_unique = len(selected)
+    if output_img_count != selected_unique:
+        raise RuntimeError(
+            f"OUTPUT COUNT MISMATCH: wrote {output_img_count} images but selected_unique={selected_unique}. "
+            "Stale files may be present. Pass --clean and rerun."
+        )
+    if output_lbl_count != selected_unique:
+        raise RuntimeError(
+            f"OUTPUT LABEL COUNT MISMATCH: wrote {output_lbl_count} labels but selected_unique={selected_unique}. "
+            "Every retrieved BDD image must have exactly one corresponding label."
+        )
+    if manifest_row_count != selected_unique:
+        raise RuntimeError(
+            f"MANIFEST COUNT MISMATCH: {manifest_row_count} rows but selected_unique={selected_unique}."
+        )
+
     # retrieval_stats.json
     source_split_counts = {"bdd_train": len(selected)}
     stats = {
-        "candidate_pool_size": len(pool_paths),
+        "candidate_pool_size": pool_count_after_filter,
+        "candidate_pool_before_class_filter": pool_count_before_filter,
+        "candidate_pool_after_class_filter": pool_count_after_filter,
+        "query_roots": [str(q) for q in args.query_roots],
+        "query_split": "train",
         "query_count": query_count,
+        "hard_query_count": len(all_hard_imgs),
         "requested_top_k": args.top_k,
         "selected_unique": len(selected),
         "similarity_threshold": args.similarity_threshold,
         "seed": args.seed,
-        "duplicate_candidates_removed": 0,
-        "overlap_with_used_bdd": overlap_count if args.used_bdd_root else -1,
+        "candidate_hits_above_threshold": ret_stats["candidate_hits_above_threshold"],
+        "unique_candidates_before_top_k": ret_stats["unique_candidates_before_top_k"],
+        "duplicate_candidate_hits_removed": ret_stats["duplicate_candidate_hits_removed"],
+        # Legacy key kept for existing test compatibility
+        "duplicate_candidates_removed": ret_stats["duplicate_candidate_hits_removed"],
+        "overlap_with_used_bdd": overlap_count,
         "source_split_counts": source_split_counts,
+        "embedding_layers": embedding_layers,
+        "embedding_dim": embedding_dim,
+        "output_image_count": output_img_count,
+        "output_label_count": output_lbl_count,
+        "manifest_row_count": manifest_row_count,
     }
     (out_root / "retrieval_stats.json").write_text(
         json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -590,6 +1240,7 @@ def main_new(args: argparse.Namespace) -> None:
 
     print(f"\nDone. Retrieved data → {out_root}")
     print(f"  selected_unique: {len(selected)}")
+    print(f"  embedding_layers: {embedding_layers}  dim: {embedding_dim}")
     print(f"  source_split: all bdd_train")
 
 
@@ -600,7 +1251,7 @@ def main_legacy(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"Active Retrieval")
+    print("Active Retrieval")
     print(f"  checkpoint:     {args.checkpoint}")
     print(f"  hard data:      {args.hard_data}")
     print(f"  pool:           {args.pool_data}")
@@ -659,7 +1310,7 @@ def main_legacy(args: argparse.Namespace) -> None:
 
     print(f"\n[4/4] Retrieving from pool (sim >= {args.sim_threshold}, top-{args.top_n})...")
 
-    exclude_stems: set[str] | None = None
+    exclude_stems: "set | None" = None
     if args.exclude_in_train:
         exclude_file = Path(args.exclude_in_train)
         if exclude_file.exists():
@@ -690,7 +1341,7 @@ def main_legacy(args: argparse.Namespace) -> None:
                 print(f"    {CLASS_NAMES[c]:12s} ({c}): {cnt} instances")
 
     scores = [s for _, s in selected]
-    print(f"\n  Similarity score stats:")
+    print("\n  Similarity score stats:")
     print(f"    min={min(scores):.3f}  mean={np.mean(scores):.3f}  max={max(scores):.3f}")
 
     print(f"\nDone. Retrieved data → {out_dir}")
