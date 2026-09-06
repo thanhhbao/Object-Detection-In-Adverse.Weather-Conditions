@@ -63,7 +63,7 @@ def verify_image_size(img_dir: Path, expect_w: int, expect_h: int, n: int = 5) -
         return
 
     samples = []
-    for p in sorted(img_dir.glob("*.jpg")):
+    for p in sorted(img_dir.rglob("*.jpg")):
         samples.append(p)
         if len(samples) >= n:
             break
@@ -103,6 +103,18 @@ def convert_split(
     print(f"[{split}] labels: {json_path}")
     verify_image_size(src_img_dir, img_w, img_h)
 
+    # Some BDD100K releases nest images in subdirectories under the split
+    # dir, so index every .jpg by basename rather than assuming a flat layout.
+    print("  Indexing images (recursive)...")
+    index: dict[str, Path] = {}
+    dupes = 0
+    for p in src_img_dir.rglob("*.jpg"):
+        if p.name in index:
+            dupes += 1
+            continue
+        index[p.name] = p
+    print(f"  Indexed {len(index)} images" + (f" ({dupes} duplicate names ignored)" if dupes else ""))
+
     print(f"  Loading JSON ({json_path.stat().st_size / 1e6:.0f} MB)...")
     records = json.loads(json_path.read_text(encoding="utf-8"))
     print(f"  Records: {len(records)}")
@@ -114,6 +126,7 @@ def convert_split(
 
     stats = {
         "records": len(records),
+        "images_indexed": len(index),
         "written": 0,
         "missing_image": 0,
         "empty_dropped": 0,
@@ -127,8 +140,8 @@ def convert_split(
         name = rec.get("name")
         if not name:
             continue
-        src_img = src_img_dir / name
-        if not src_img.exists():
+        src_img = index.get(name)
+        if src_img is None:
             stats["missing_image"] += 1
             continue
 
