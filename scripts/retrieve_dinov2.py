@@ -608,8 +608,18 @@ def retrieve_dinov2_quota(
     selected_stems: set = set()
     selected: list = []
 
-    # Quota fill: process classes from smallest quota first to avoid starvation
-    for cls_id in sorted(class_quotas, key=lambda c: class_quotas[c]):
+    # Quota fill: process the scarcest class first. Availability, not quota
+    # size, is what causes starvation — final_score rewards multi-rare images,
+    # so an abundant class processed early would drain the scarce classes'
+    # candidates before they ever get to pick.
+    availability = {
+        cls_id: sum(1 for e in pool_entries.values() if cls_id in e["class_ids"])
+        for cls_id in class_quotas
+    }
+    fill_order = sorted(
+        class_quotas, key=lambda c: (availability[c], class_quotas[c], c)
+    )
+    for cls_id in fill_order:
         quota = class_quotas[cls_id]
         candidates = [
             entry for stem, entry in pool_entries.items()
@@ -655,6 +665,12 @@ def retrieve_dinov2_quota(
         ),
         "selected_by_query_dataset": dict(ds_counter),
         "selected_by_reason": dict(reason_counter),
+        "class_availability": {str(k): v for k, v in availability.items()},
+        "class_quota_shortfall": {
+            str(c): max(0, class_quotas[c] - availability[c])
+            for c in class_quotas if availability[c] < class_quotas[c]
+        },
+        "quota_fill_order": [str(c) for c in fill_order],
         "sim_all_min": float(np.min(max_sim_per_pool)),
         "sim_all_median": float(np.median(max_sim_per_pool)),
         "sim_all_mean": float(np.mean(max_sim_per_pool)),
