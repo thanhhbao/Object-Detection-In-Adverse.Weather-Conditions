@@ -171,11 +171,13 @@ def sweep(records: dict, n_gt: dict, grid: np.ndarray) -> dict:
         if g == 0:
             out[c] = None
             continue
+        # float64 throughout: score_at() compares Python floats, and a float32
+        # cast here would disagree with it on confidences sitting on a grid point.
         if recs:
-            conf = np.array([r[0] for r in recs], dtype=np.float32)
+            conf = np.array([r[0] for r in recs], dtype=np.float64)
             istp = np.array([r[1] for r in recs], dtype=bool)
         else:
-            conf = np.zeros(0, dtype=np.float32)
+            conf = np.zeros(0, dtype=np.float64)
             istp = np.zeros(0, dtype=bool)
 
         f1s, ps, rs = [], [], []
@@ -192,6 +194,93 @@ def sweep(records: dict, n_gt: dict, grid: np.ndarray) -> dict:
     return out
 
 
+def score_at(records: dict, n_gt: dict, cls_id: int, t: float) -> tuple:
+    """Precision, recall and F1 for one class at one threshold."""
+    recs = records[cls_id]
+    g = n_gt[cls_id]
+    if g == 0:
+        return float("nan"), float("nan"), float("nan")
+    tp = sum(1 for c, is_tp in recs if c >= t and is_tp)
+    fp = sum(1 for c, is_tp in recs if c >= t and not is_tp)
+    p = tp / (tp + fp) if (tp + fp) else 0.0
+    r = tp / g
+    return p, r, (2 * p * r / (p + r) if (p + r) else 0.0)
+
+
+def apply_mode(args, records: dict, n_gt: dict) -> int:
+    """Carry thresholds fitted elsewhere onto this split and see if they hold."""
+    fitted = json.loads(args.apply.read_text(encoding="utf-8"))
+    shared_t = float(fitted["shared_threshold"])
+    per_class = fitted["per_class_thresholds"]
+
+    print(f"\nThresholds fitted on: {fitted.get('data')} / {fitted.get('split')}")
+    print(f"Applied to:           {args.data} / {args.split}")
+    print(f"Shared threshold:     {shared_t:.2f}")
+    print(f"Gain when fitted:     {fitted.get('mean_f1_gain'):+.4f}\n")
+
+    rows = []
+    for c, name in enumerate(CLASS_NAMES):
+        if n_gt[c] == 0:
+            continue
+        t = float(per_class.get(name, shared_t))
+        sp, sr, sf = score_at(records, n_gt, c, shared_t)
+        tp_, tr, tf = score_at(records, n_gt, c, t)
+        rows.append({"class_id": c, "class": name, "support": n_gt[c],
+                     "threshold": round(t, 4),
+                     "shared_f1": round(sf, 4), "shared_p": round(sp, 4),
+                     "shared_r": round(sr, 4),
+                     "tuned_f1": round(tf, 4), "tuned_p": round(tp_, 4),
+                     "tuned_r": round(tr, 4),
+                     "delta_f1": round(tf - sf, 4),
+                     "low_support": n_gt[c] < LOW_SUPPORT})
+
+    mean_shared = float(np.mean([r["shared_f1"] for r in rows]))
+    mean_tuned = float(np.mean([r["tuned_f1"] for r in rows]))
+    gain = mean_tuned - mean_shared
+
+    hdr = (f"{'class':12s} {'sup':>6s} {'t':>6s} {'shared F1':>10s}"
+           f" {'tuned F1':>9s} {'ΔF1':>8s}")
+    print(hdr)
+    print("-" * len(hdr))
+    for r in rows:
+        mark = "!" if r["low_support"] else " "
+        print(f"{r['class']:11s}{mark} {r['support']:6d} {r['threshold']:6.2f} "
+              f"{r['shared_f1']:10.4f} {r['tuned_f1']:9.4f} {r['delta_f1']:+8.4f}")
+    print("-" * len(hdr))
+    print(f"{'mean F1':12s} {'':6s} {'':6s} {mean_shared:10.4f} "
+          f"{mean_tuned:9.4f} {gain:+8.4f}")
+
+    fitted_gain = float(fitted.get("mean_f1_gain", 0.0))
+    ratio = gain / fitted_gain if fitted_gain else float("nan")
+    print()
+    if gain <= 0:
+        print("Gain did NOT carry over — the thresholds were fitted to noise on "
+              "the tuning split. Do not adopt them.")
+    elif ratio >= 0.5:
+        print(f"Gain carried over ({ratio:.0%} of the fitted {fitted_gain:+.4f}). "
+              "The thresholds generalise; adopting them is justified.")
+    else:
+        print(f"Gain shrank to {ratio:.0%} of the fitted {fitted_gain:+.4f}. "
+              "Partly real, partly overfitting — report the carried-over number, "
+              "not the fitted one.")
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "applied.json").write_text(json.dumps({
+        "fitted_from": str(args.apply),
+        "fitted_on": {"data": fitted.get("data"), "split": fitted.get("split")},
+        "applied_to": {"data": str(args.data), "split": args.split},
+        "shared_threshold": round(shared_t, 4),
+        "mean_f1_shared": round(mean_shared, 4),
+        "mean_f1_tuned": round(mean_tuned, 4),
+        "mean_f1_gain": round(gain, 4),
+        "mean_f1_gain_when_fitted": round(fitted_gain, 4),
+        "carryover_ratio": round(ratio, 4) if ratio == ratio else None,
+        "detail": rows,
+    }, indent=2), encoding="utf-8")
+    print(f"\nSaved → {args.out / 'applied.json'}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", required=True)
@@ -206,6 +295,9 @@ def main() -> int:
     ap.add_argument("--grid-step", type=float, default=0.01)
     ap.add_argument("--batch", type=int, default=8,
                     help="Images per inference call; lower it if VRAM is tight")
+    ap.add_argument("--apply", type=Path, default=None, metavar="THRESHOLDS_JSON",
+                    help="Skip tuning; evaluate at thresholds fitted on another "
+                         "split and report whether the gain carried over")
     args = ap.parse_args()
 
     if args.split == "test" and not args.allow_test:
@@ -219,6 +311,9 @@ def main() -> int:
     records, n_gt = collect(args.weights, img_dir, lbl_dir, args.imgsz,
                             args.device, args.min_conf, args.match_iou,
                             args.batch)
+
+    if args.apply is not None:
+        return apply_mode(args, records, n_gt)
 
     grid = np.arange(args.grid_step, 0.95 + 1e-9, args.grid_step)
     curves = sweep(records, n_gt, grid)
