@@ -193,6 +193,10 @@ def main() -> int:
                 tag = f"{arm_name}__{ds_name}__{split}"
                 if not split_exists(Path(ds_yaml), split):
                     print(f"[{n}/{total}] {tag} — skipped (no '{split}' split)", flush=True)
+                    # Record it: a silently absent cell reads as a result.
+                    failures.append({"arm": arm_name, "dataset": ds_name,
+                                     "split": split, "error": "skipped: split "
+                                     f"'{split}' missing or empty"})
                     continue
                 print(f"[{n}/{total}] {tag}", flush=True)
                 try:
@@ -345,12 +349,26 @@ def main() -> int:
     (args.out / "inversions.json").write_text(
         json.dumps(inversions, indent=2), encoding="utf-8")
 
+    expected = len(arms) * len(datasets) * len(args.split)
+    produced = len(results)
+    (args.out / "coverage.json").write_text(json.dumps({
+        "expected_cells": expected,
+        "produced_cells": produced,
+        "arms": list(arms),
+        "datasets": list(datasets),
+        "splits": args.split,
+        "failures": failures,
+    }, indent=2), encoding="utf-8")
+
     if failures:
         (args.out / "failures.json").write_text(
             json.dumps(failures, indent=2), encoding="utf-8")
-        print(f"\n{len(failures)} evaluation(s) failed — see {args.out / 'failures.json'}")
+        print(f"\n{len(failures)} evaluation(s) missing — see {args.out / 'failures.json'}")
         for f in failures:
             print(f"  {f['arm']}/{f['dataset']}/{f['split']}: {f['error']}")
+    if produced != expected:
+        print(f"\nWARNING: {produced}/{expected} cells produced. A missing cell "
+              "is not a zero — check coverage.json before reporting these numbers.")
 
     print(f"\nCSV      → {csv_path}")
     print(f"Report   → {md_path}")
