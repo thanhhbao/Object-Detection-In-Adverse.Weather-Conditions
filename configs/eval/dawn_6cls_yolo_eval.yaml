@@ -1,0 +1,21 @@
+# DAWN, 6 lớp — chỉ dùng để đánh giá (miền ngoài, không huấn luyện).
+#
+# Ultralytics bắt buộc mọi data YAML phải có cả `train` và `val`, nhưng DAWN
+# không có phần huấn luyện. `train` ở đây trỏ vào val làm chỗ giữ chỗ; khi chỉ
+# gọi model.val() thì khoá này không bao giờ được đọc.
+#
+# Không dùng file này để huấn luyện.
+path: /workspace/datasets_noleak/dawn_6cls_yolo
+
+train: images/val   # chỗ giữ chỗ — xem ghi chú ở trên
+val: images/val
+test: images/test
+
+nc: 6
+names:
+  0: person
+  1: bicycle
+  2: car
+  3: motorcycle
+  4: bus
+  5: truck
