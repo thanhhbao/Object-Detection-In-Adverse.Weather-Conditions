@@ -89,7 +89,7 @@ def iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def collect(weights: str, img_dir: Path, lbl_dir: Path, imgsz: int, device: str,
-            min_conf: float, match_iou: float) -> tuple[dict, dict]:
+            min_conf: float, match_iou: float, batch: int) -> tuple[dict, dict]:
     """Run inference once, return per-class (conf, is_tp) records and GT counts."""
     from dawn_ablation.common import register_custom_modules
     register_custom_modules()
@@ -99,16 +99,23 @@ def collect(weights: str, img_dir: Path, lbl_dir: Path, imgsz: int, device: str,
                   if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
     if not imgs:
         raise SystemExit(f"No images under {img_dir}")
-    print(f"  {len(imgs)} images, inference at conf>={min_conf}")
+    print(f"  {len(imgs)} images, inference at conf>={min_conf}, batch={batch}")
 
     model = YOLO(weights)
     records: dict[int, list] = {i: [] for i in range(len(CLASS_NAMES))}
     n_gt: dict[int, int] = {i: 0 for i in range(len(CLASS_NAMES))}
 
+    # Feed in fixed-size chunks. Handing Ultralytics the whole list makes it
+    # size the batch — and the warmup tensor — to the number of images, which
+    # exhausts VRAM on the larger splits.
+    def stream():
+        for i in range(0, len(imgs), batch):
+            chunk = [str(p) for p in imgs[i:i + batch]]
+            yield from model.predict(source=chunk, stream=True, conf=min_conf,
+                                     imgsz=imgsz, device=device, verbose=False)
+
     done = 0
-    for res in model.predict(source=[str(p) for p in imgs], stream=True,
-                             conf=min_conf, imgsz=imgsz, device=device,
-                             verbose=False):
+    for res in stream():
         done += 1
         if done % 500 == 0:
             print(f"    {done}/{len(imgs)}", flush=True)
@@ -197,6 +204,8 @@ def main() -> int:
     ap.add_argument("--min-conf", type=float, default=0.001)
     ap.add_argument("--match-iou", type=float, default=0.5)
     ap.add_argument("--grid-step", type=float, default=0.01)
+    ap.add_argument("--batch", type=int, default=8,
+                    help="Images per inference call; lower it if VRAM is tight")
     args = ap.parse_args()
 
     if args.split == "test" and not args.allow_test:
@@ -208,7 +217,8 @@ def main() -> int:
     print(f"Images: {img_dir}\nLabels: {lbl_dir}")
 
     records, n_gt = collect(args.weights, img_dir, lbl_dir, args.imgsz,
-                            args.device, args.min_conf, args.match_iou)
+                            args.device, args.min_conf, args.match_iou,
+                            args.batch)
 
     grid = np.arange(args.grid_step, 0.95 + 1e-9, args.grid_step)
     curves = sweep(records, n_gt, grid)
